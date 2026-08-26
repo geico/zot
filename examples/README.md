@@ -1511,4 +1511,8 @@ Scan results are cached by manifest digest. Editing an ignore file does not inva
 
 `vulnSeveritySources` is a list of source names in priority order (for example `auto`, `nvd`, or vendor IDs such as `redhat`, `alpine`). If omitted, zot defaults it to `["auto"]`, consistent with the Trivy CLI. See [Trivy: severity selection](https://trivy.dev/docs/latest/scanner/vulnerability/#severity-selection).
 
+`detectionPriority` mirrors Trivy's [`--detection-priority`](https://trivy.dev/docs/latest/scanner/vulnerability/#detection-priority) and accepts `precise` (default) or `comprehensive`. `comprehensive` stops Trivy filtering files owned by the OS package manager, so those files are reported a second time as language packages matched against NVD. On distributions that backport security fixes (RHEL, SLES) this typically results in reported vulnerabilities that the vendor has already patched.
+
+`scanRemovedPkgs` mirrors Trivy's `--removed-pkgs` and reports vulnerabilities for packages deleted in later image layers. `includeDevDeps` mirrors Trivy's `--include-dev-deps` and reports development dependencies. Both default to `false`.
+
 `sbom.enable` lets zot generate SBOMs while scanning and store them as OCI artifacts attached to the scanned image. `sbom.format` supports `spdx-json` (default) and `cyclonedx`.
