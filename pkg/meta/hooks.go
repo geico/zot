@@ -346,14 +346,20 @@ func OnGetManifest(name, reference, mediaType string, body []byte,
 		return nil
 	}
 
-	if !(mediaType == v1.MediaTypeImageManifest || mediaType == v1.MediaTypeImageIndex ||
-		compat.IsCompatibleManifestMediaType(mediaType) || compat.IsCompatibleManifestListMediaType(mediaType)) {
+	if !compat.IsImageManifestMediaType(mediaType) && !compat.IsImageIndexMediaType(mediaType) {
 		return nil
 	}
 
 	err = metaDB.UpdateStatsOnDownload(name, reference)
 	if err != nil {
-		log.Error().Err(err).Str("repository", name).Str("reference", reference).
+		// Expected when meta lags the image store; keep quiet (caller already served the manifest).
+		if errors.Is(err, zerr.ErrImageMetaNotFound) || errors.Is(err, zerr.ErrRepoMetaNotFound) {
+			return err
+		}
+
+		// Best-effort bookkeeping: the caller serves the manifest regardless of this error
+		// (e.g. a contended per-repo metaDB lock under a concurrent pull burst), so log at warn.
+		log.Warn().Err(err).Str("repository", name).Str("reference", reference).
 			Msg("failed to update stats on download image")
 
 		return err

@@ -2155,6 +2155,42 @@ func TestTLSWithBasicAuth(t *testing.T) {
 	})
 }
 
+func TestStrictTransportSecurityOnUnmatchedRoute(t *testing.T) {
+	Convey("Make a new TLS controller", t, func() {
+		_, serverCertPath, serverKeyPath, _, _, caCertPEM := setupTestCerts(t)
+
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCertPEM)
+
+		resty.SetTLSClientConfig(&tls.Config{RootCAs: caCertPool, MinVersion: tls.VersionTLS12})
+
+		defer func() { resty.SetTLSClientConfig(nil) }()
+
+		conf := config.New()
+		conf.HTTP.Port = "0"
+		conf.HTTP.TLS = &config.TLSConfig{
+			Cert: serverCertPath,
+			Key:  serverKeyPath,
+		}
+
+		ctlr := makeController(conf, t.TempDir())
+
+		cm := test.NewControllerManager(ctlr)
+		secureBaseURL := cm.StartAndWait()
+
+		defer cm.StopServer()
+
+		// this path doesn't match any registered route, so mux.Router falls back to
+		// its NotFoundHandler, which never runs router.Use() middlewares - HSTS must
+		// still be set because it's applied at the http.Server.Handler boundary.
+		resp, err := resty.R().Get(secureBaseURL + "/this-route-does-not-exist")
+		So(err, ShouldBeNil)
+		So(resp, ShouldNotBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+		So(resp.Header().Get("Strict-Transport-Security"), ShouldEqual, "max-age=63072000; includeSubDomains")
+	})
+}
+
 func TestTLSWithBasicAuthAllowReadAccess(t *testing.T) {
 	Convey("Make a new controller", t, func() {
 		// Generate certificates dynamically for the test
@@ -2641,8 +2677,7 @@ func TestBasicAuthWithReloadedCredentials(t *testing.T) {
 		ctlr := api.NewController(conf)
 		ctlrManager := test.NewControllerManager(ctlr)
 
-		hotReloader, err := server.NewHotReloader(ctlr, configPath, ldapConfigPath)
-		So(err, ShouldBeNil)
+		hotReloader := server.NewHotReloader(ctlr, configPath, ldapConfigPath)
 
 		hotReloader.Start()
 
@@ -7319,6 +7354,84 @@ func TestAuthorizationWithOnlyAnonymousPolicy(t *testing.T) {
 		So(len(catalog.Repositories), ShouldEqual, 2)
 		So(catalog.Repositories, ShouldContain, TestRepo)
 		So(catalog.Repositories, ShouldContain, "zot-test")
+	})
+}
+
+// anonymous-only (no CookieStore) + UI X-ZOT-API-CLIENT must not panic on search.
+func TestAnonymousOnlyWithUIClientHeader(t *testing.T) {
+	Convey("anonymous-only access with UI client header does not panic", t, func() {
+		const testRepo = "docker.com/library/nginx"
+
+		defaultVal := true
+		conf := config.New()
+		conf.Storage.GC = false
+		conf.HTTP.Port = "0"
+		conf.HTTP.Auth = &config.AuthConfig{}
+		conf.HTTP.AccessControl = &config.AccessControlConfig{
+			Repositories: config.Repositories{
+				"**": config.PolicyGroup{
+					AnonymousPolicy: []string{"read", "create", "update"},
+				},
+			},
+		}
+		conf.Extensions = &extconf.ExtensionConfig{
+			Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+			UI:     &extconf.UIConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+		}
+
+		ctlr := makeController(conf, t.TempDir())
+		cm := test.NewControllerManager(ctlr)
+		baseURL := cm.StartAndWait()
+
+		defer cm.StopServer()
+
+		So(ctlr.CookieStore, ShouldBeNil)
+
+		err := UploadImage(CreateRandomImage(), baseURL, testRepo, "alpine")
+		So(err, ShouldBeNil)
+
+		uiClient := resty.R().
+			SetHeader(constants.SessionClientHeaderName, constants.SessionClientHeaderValue)
+
+		resp, err := uiClient.Get(baseURL + "/v2/")
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+
+		resp, err = uiClient.Get(baseURL + "/v2/_catalog")
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+
+		query := `{RepoListWithNewestImage{Results{Name NewestImage{Tag}}}}`
+		resp, err = uiClient.Get(baseURL + constants.FullSearchPrefix + "?query=" + url.QueryEscape(query))
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+		So(string(resp.Body()), ShouldContainSubstring, testRepo)
+	})
+
+	Convey("open registry (no accessControl) with UI client header does not panic", t, func() {
+		defaultVal := true
+		conf := config.New()
+		conf.Storage.GC = false
+		conf.HTTP.Port = "0"
+		conf.HTTP.Auth = &config.AuthConfig{}
+		conf.Extensions = &extconf.ExtensionConfig{
+			Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+		}
+
+		ctlr := makeController(conf, t.TempDir())
+		cm := test.NewControllerManager(ctlr)
+		baseURL := cm.StartAndWait()
+
+		defer cm.StopServer()
+
+		So(ctlr.CookieStore, ShouldBeNil)
+
+		resp, err := resty.R().
+			SetHeader(constants.SessionClientHeaderName, constants.SessionClientHeaderValue).
+			Get(baseURL + constants.FullSearchPrefix + "?query=" +
+				url.QueryEscape(`{RepoListWithNewestImage{Results{Name}}}`))
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusOK)
 	})
 }
 

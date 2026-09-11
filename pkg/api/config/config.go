@@ -18,6 +18,7 @@ import (
 	"zotregistry.dev/zot/v2/pkg/buildinfo"
 	"zotregistry.dev/zot/v2/pkg/compat"
 	extconf "zotregistry.dev/zot/v2/pkg/extensions/config"
+	eventsconf "zotregistry.dev/zot/v2/pkg/extensions/config/events"
 	storageConstants "zotregistry.dev/zot/v2/pkg/storage/constants"
 )
 
@@ -1186,7 +1187,26 @@ func (c *Config) UpdateReloadableConfig(newConfig *Config) {
 
 		// Update scrub extension
 		c.Extensions.Scrub = newConfig.Extensions.Scrub
+
+		// Update events extension
+		c.Extensions.Events = newConfig.Extensions.Events
 	}
+}
+
+// SnapshotJSON returns the config serialized under the read lock with secrets
+// left unmasked, for callers that compare two configs and report only which
+// fields differ. It is a view, not a clone: whatever JSON does not carry is
+// absent, session keys and ldap bind credentials among it. Use Sanitize for
+// anything shown to a user, and the Copy* accessors for real values.
+func (c *Config) SnapshotJSON() ([]byte, error) {
+	if c == nil {
+		return nil, nil
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return json.Marshal(c)
 }
 
 // CopyAuthConfig returns a copy of the auth config if it exists.
@@ -1498,6 +1518,35 @@ func (c *Config) StorageFingerprint() string {
 	for name, subPath := range norm.SubPaths {
 		subPath.GCMaxSchedulerDelay = 0
 		norm.SubPaths[name] = subPath
+	}
+
+	// encoding/json sorts map keys, so the serialization is deterministic across restarts.
+	blob, err := json.Marshal(norm)
+	if err != nil {
+		return ""
+	}
+
+	sum := sha256.Sum256(blob)
+
+	return hex.EncodeToString(sum[:])
+}
+
+// EventsFingerprint returns a stable SHA-256 of the events extension config.
+func (c *Config) EventsFingerprint() string {
+	if c == nil {
+		return ""
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.Extensions == nil || c.Extensions.Events == nil {
+		return ""
+	}
+
+	var norm eventsconf.Config
+	if err := DeepCopy(c.Extensions.Events, &norm); err != nil {
+		return ""
 	}
 
 	// encoding/json sorts map keys, so the serialization is deterministic across restarts.

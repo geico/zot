@@ -327,8 +327,17 @@ func (is *ImageStore) GetNextRepositories(lastRepo string, maxEntries int, filte
 
 		rel = filepath.ToSlash(rel)
 
-		if ok, err := is.ValidateRepo(rel); !ok || err != nil {
-			return nil //nolint:nilerr // ignore invalid repos
+		ok, err := is.ValidateRepo(rel)
+		if errors.Is(err, zerr.ErrInvalidRepositoryName) {
+			// Names that can never be repos (e.g. lost+found): do not descend —
+			// listing unreadable FS dirs would fail the whole walk.
+			return driver.ErrSkipDir
+		}
+
+		if !ok || err != nil {
+			// Not an OCI layout yet, but the name is valid — keep walking children
+			// so nested repos (path "org" → "org/team") are still discovered.
+			return nil //nolint:nilerr
 		}
 
 		if lastRepo == rel {
@@ -341,7 +350,7 @@ func (is *ImageStore) GetNextRepositories(lastRepo string, maxEntries int, filte
 			found = true
 		}
 
-		ok, err := filterFn(rel)
+		ok, err = filterFn(rel)
 		if err != nil {
 			return err
 		}
@@ -403,8 +412,17 @@ func (is *ImageStore) GetRepositories() ([]string, error) {
 
 		rel = filepath.ToSlash(rel)
 
-		if ok, err := is.ValidateRepo(rel); !ok || err != nil {
-			return nil //nolint:nilerr // ignore invalid repos
+		ok, err := is.ValidateRepo(rel)
+		if errors.Is(err, zerr.ErrInvalidRepositoryName) {
+			// Names that can never be repos (e.g. lost+found): do not descend —
+			// listing unreadable FS dirs would fail the whole walk.
+			return driver.ErrSkipDir
+		}
+
+		if !ok || err != nil {
+			// Not an OCI layout yet, but the name is valid — keep walking children
+			// so nested repos (path "org" → "org/team") are still discovered.
+			return nil //nolint:nilerr
 		}
 
 		stores = append(stores, rel)
@@ -468,8 +486,16 @@ func (is *ImageStore) GetNextRepository(processedRepos map[string]struct{}) (str
 		}
 
 		ok, err := is.ValidateRepo(rel)
+		if errors.Is(err, zerr.ErrInvalidRepositoryName) {
+			// Names that can never be repos (e.g. lost+found): do not descend —
+			// listing unreadable FS dirs would fail the whole walk.
+			return driver.ErrSkipDir
+		}
+
 		if !ok || err != nil {
-			return nil //nolint:nilerr // ignore invalid repos
+			// Not an OCI layout yet, but the name is valid — keep walking children
+			// so nested repos (path "org" → "org/team") are still discovered.
+			return nil //nolint:nilerr
 		}
 
 		store = rel
@@ -634,7 +660,7 @@ func (is *ImageStore) PutImageManifest(ctx context.Context, repo, reference, med
 
 	artifactType := ""
 
-	if mediaType == ispec.MediaTypeImageManifest || compat.IsCompatibleManifestMediaType(mediaType) {
+	if compat.IsImageManifestMediaType(mediaType) {
 		var manifest ispec.Manifest
 
 		err := json.Unmarshal(body, &manifest)
@@ -647,7 +673,7 @@ func (is *ImageStore) PutImageManifest(ctx context.Context, repo, reference, med
 		}
 
 		artifactType = zcommon.GetManifestArtifactType(manifest)
-	} else if mediaType == ispec.MediaTypeImageIndex || compat.IsCompatibleManifestListMediaType(mediaType) {
+	} else if compat.IsImageIndexMediaType(mediaType) {
 		var imgIndex ispec.Index
 
 		err := json.Unmarshal(body, &imgIndex)
@@ -852,9 +878,9 @@ func (is *ImageStore) deleteImageManifest(ctx context.Context, repo, reference s
 	/* check if manifest is referenced in image indexes, do not allow index images manipulations
 	(ie. remove manifest being part of an image index)	*/
 	if zcommon.IsDigest(reference) &&
-		(common.IsImageManifestMediaType(manifestDesc.MediaType) || common.IsImageIndexMediaType(manifestDesc.MediaType)) {
+		(compat.IsImageManifestMediaType(manifestDesc.MediaType) || compat.IsImageIndexMediaType(manifestDesc.MediaType)) {
 		for _, mDesc := range index.Manifests {
-			if common.IsImageIndexMediaType(mDesc.MediaType) {
+			if compat.IsImageIndexMediaType(mDesc.MediaType) {
 				ok, err := common.IsBlobReferencedInImageIndex(is, repo, manifestDesc.Digest, ispec.Index{
 					Manifests: []ispec.Descriptor{mDesc},
 				}, is.log)
