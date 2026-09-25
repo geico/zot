@@ -21,7 +21,6 @@ import (
 
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	godigest "github.com/opencontainers/go-digest"
-	imeta "github.com/opencontainers/image-spec/specs-go"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	. "github.com/smartystreets/goconvey/convey"
 
@@ -138,9 +137,9 @@ func TestStorageFSAPIs(t *testing.T) {
 					},
 				},
 				Annotations: annotationsMap,
-			}
 
-			manifest.SchemaVersion = 2
+				SchemaVersion: 2,
+			}
 			manifestBuf, err := json.Marshal(manifest)
 			So(err, ShouldBeNil)
 
@@ -1271,8 +1270,9 @@ func TestDedupeLinks(t *testing.T) {
 						Size:      int64(buflen),
 					},
 				},
+
+				SchemaVersion: 2,
 			}
-			manifest.SchemaVersion = 2
 			manifestBuf, err := json.Marshal(manifest)
 			So(err, ShouldBeNil)
 
@@ -1335,8 +1335,9 @@ func TestDedupeLinks(t *testing.T) {
 						Size:      int64(buflen),
 					},
 				},
+
+				SchemaVersion: 2,
 			}
-			manifest.SchemaVersion = 2
 			manifestBuf, err = json.Marshal(manifest)
 			So(err, ShouldBeNil)
 
@@ -2919,8 +2920,9 @@ func TestGarbageCollectErrors(t *testing.T) {
 							Size:      int64(bsize1),
 						},
 					},
+
+					SchemaVersion: 2,
 				}
-				manifest.SchemaVersion = 2
 				content, err = json.Marshal(manifest)
 				So(err, ShouldBeNil)
 
@@ -2958,18 +2960,18 @@ func TestGarbageCollectErrors(t *testing.T) {
 			So(err, ShouldNotBeNil)
 		})
 
-		Convey("Missing untagged manifest blob aborts GC on StatBlob", func() {
+		Convey("Missing untagged manifest blob does not abort GC", func() {
 			digest = putUntaggedManifestForGCErrors(imgStore, repoName, bdgst1, bsize1)
 
-			// Identify soft-continues on Get miss, but untagged removal still Stats the digest
-			// for the retention delay; StatBlob miss fails closed (same as main).
+			// Identify soft-continues on Get miss; age check also skips on StatBlob miss so
+			// CleanRepo reaches removeStaleManifestEntries and drops the absent index row.
 			err = os.Remove(imgStore.BlobPath(repoName, digest))
 			So(err, ShouldBeNil)
 
 			time.Sleep(500 * time.Millisecond)
 
 			err = gc.CleanRepo(ctx, repoName)
-			So(err, ShouldNotBeNil)
+			So(err, ShouldBeNil)
 		})
 
 		Convey("Corrupt untagged manifest blob aborts GC", func() {
@@ -3017,8 +3019,9 @@ func TestGarbageCollectErrors(t *testing.T) {
 						Size:      int64(bsize1),
 					},
 				},
+
+				SchemaVersion: 2,
 			}
-			manifest.SchemaVersion = 2
 			content, err = json.Marshal(manifest)
 			So(err, ShouldBeNil)
 
@@ -3077,8 +3080,9 @@ func putUntaggedManifestForGCErrors(imgStore storageTypes.ImageStore, repoName s
 				Size:      int64(layerSize),
 			},
 		},
+
+		SchemaVersion: 2,
 	}
-	manifest.SchemaVersion = 2
 	content, err := json.Marshal(manifest)
 	So(err, ShouldBeNil)
 
@@ -4076,10 +4080,8 @@ func NewRandomImgManifest(data []byte, cdigest, ldigest godigest.Digest, cblob, 
 				Size:      int64(len(lblob)),
 			},
 		},
-		Annotations: annotationsMap,
-		Versioned: imeta.Versioned{
-			SchemaVersion: schemaVersion,
-		},
+		Annotations:   annotationsMap,
+		SchemaVersion: schemaVersion,
 	}
 
 	return &manifest, nil
@@ -4139,7 +4141,7 @@ func TestGetNextDigestWithBlobPathsNestedRepo(t *testing.T) {
 			So(err, ShouldBeNil)
 			So(os.WriteFile(path.Join(repoDir, ispec.ImageLayoutFile), ilBuf, storageConstants.DefaultFilePerms), ShouldBeNil)
 
-			idxBuf, err := json.Marshal(ispec.Index{Versioned: imeta.Versioned{SchemaVersion: 2}})
+			idxBuf, err := json.Marshal(ispec.Index{SchemaVersion: 2})
 			So(err, ShouldBeNil)
 			So(os.WriteFile(path.Join(repoDir, ispec.ImageIndexFile), idxBuf, storageConstants.DefaultFilePerms), ShouldBeNil)
 
@@ -4207,7 +4209,7 @@ func TestBlobPathsByDigest(t *testing.T) {
 			So(os.WriteFile(path.Join(repoDir, ispec.ImageLayoutFile), ilBuf, storageConstants.DefaultFilePerms),
 				ShouldBeNil)
 
-			idxBuf, err := json.Marshal(ispec.Index{Versioned: imeta.Versioned{SchemaVersion: 2}})
+			idxBuf, err := json.Marshal(ispec.Index{SchemaVersion: 2})
 			So(err, ShouldBeNil)
 			So(os.WriteFile(path.Join(repoDir, ispec.ImageIndexFile), idxBuf, storageConstants.DefaultFilePerms),
 				ShouldBeNil)
@@ -4392,4 +4394,54 @@ func isKnownErr(err error) bool {
 	}
 
 	return false
+}
+
+func TestGetNextRepositoriesWithMissingLast(t *testing.T) {
+	dir := t.TempDir()
+	logBuf := &bytes.Buffer{}
+	log := zlog.NewLoggerWithWriter("debug", logBuf)
+	metrics := monitoring.NewNopMetricServer()
+	cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{
+		RootDir:     dir,
+		Name:        "cache",
+		UseRelPaths: true,
+	}, log)
+
+	imgStore := local.NewImageStore(dir, true, true, log, metrics, nil, cacheDriver, nil, nil)
+	storeController := storage.StoreController{DefaultStore: imgStore}
+	image := CreateDefaultImage()
+
+	for _, repo := range []string{"a/z", "a-foo", "b"} {
+		if err := WriteImageToFileSystem(image, repo, "0.0.1", storeController); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	Convey("A last that is not a repo only returns repos that sort after it", t, func() {
+		repos, more, err := imgStore.GetNextRepositories("a.", 10, func(repo string) (bool, error) {
+			return true, nil
+		})
+		So(err, ShouldBeNil)
+		So(more, ShouldBeFalse)
+		So(repos, ShouldResemble, []string{"a/z", "b"})
+	})
+
+	Convey("A deleted last does not log a storage error", t, func() {
+		logBuf.Reset()
+		repos, more, err := imgStore.GetNextRepositories("a-bar", 10, func(repo string) (bool, error) {
+			return true, nil
+		})
+		So(err, ShouldBeNil)
+		So(more, ShouldBeFalse)
+		So(repos, ShouldResemble, []string{"a/z", "a-foo", "b"})
+		So(logBuf.String(), ShouldNotContainSubstring, "failed to read directory")
+	})
+
+	Convey("A last that is a repo keeps walk order after it", t, func() {
+		repos, _, err := imgStore.GetNextRepositories("a/z", 10, func(repo string) (bool, error) {
+			return true, nil
+		})
+		So(err, ShouldBeNil)
+		So(repos, ShouldResemble, []string{"a-foo", "b"})
+	})
 }

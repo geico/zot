@@ -353,8 +353,7 @@ func TestPutImageManifestExtraTagsAndEvents(t *testing.T) {
 		_, _, err = imgStore.FullBlobUpload(context.Background(), repo, bytes.NewReader(layerBytes), layerDigest)
 		So(err, ShouldBeNil)
 
-		manifest := ispec.Manifest{}
-		manifest.SchemaVersion = 2
+		manifest := ispec.Manifest{SchemaVersion: 2}
 		manifest.Config = ispec.Descriptor{
 			MediaType: "application/vnd.oci.image.config.v1+json",
 			Digest:    cdigest,
@@ -387,8 +386,7 @@ func TestPutImageManifestExtraTagsAndEvents(t *testing.T) {
 		_, _, err = imgStore.FullBlobUpload(context.Background(), repo, bytes.NewReader(layerBytes), layerDigest)
 		So(err, ShouldBeNil)
 
-		manifest := ispec.Manifest{}
-		manifest.SchemaVersion = 2
+		manifest := ispec.Manifest{SchemaVersion: 2}
 		manifest.Config = ispec.Descriptor{
 			MediaType: "application/vnd.oci.image.config.v1+json",
 			Digest:    cdigest,
@@ -462,8 +460,7 @@ func TestPutImageManifestExtraTagsAndEvents(t *testing.T) {
 		_, _, err = imgStore.FullBlobUpload(context.Background(), repo, bytes.NewReader(layerBytes), layerDigest)
 		So(err, ShouldBeNil)
 
-		manifest := ispec.Manifest{}
-		manifest.SchemaVersion = 2
+		manifest := ispec.Manifest{SchemaVersion: 2}
 		manifest.Config = ispec.Descriptor{
 			MediaType: "application/vnd.oci.image.config.v1+json",
 			Digest:    cdigest,
@@ -525,8 +522,7 @@ func TestPutImageManifestExtraTagsAndEvents(t *testing.T) {
 		_, _, err = imgStore.FullBlobUpload(context.Background(), repo, bytes.NewReader(layerBytes), layerDigest)
 		So(err, ShouldBeNil)
 
-		manifest := ispec.Manifest{}
-		manifest.SchemaVersion = 2
+		manifest := ispec.Manifest{SchemaVersion: 2}
 		manifest.Config = ispec.Descriptor{
 			MediaType: "application/vnd.oci.image.config.v1+json",
 			Digest:    cdigest,
@@ -593,6 +589,132 @@ func TestPutImageManifestExtraTagsAndEvents(t *testing.T) {
 	})
 }
 
+// TestTagOverwriteRetainsDigestAccess covers issue #4444: overwriting the last tag that
+// references a digest must leave that digest pullable (same as delete-by-tag).
+func TestTagOverwriteRetainsDigestAccess(t *testing.T) {
+	Convey("last tag overwrite keeps previous single-arch digest pullable", t, func() {
+		rootDir := t.TempDir()
+		log := zlog.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+		imgStore := local.NewImageStore(rootDir, false, true, log, metrics, nil, nil, nil, nil)
+		storeController := storage.StoreController{DefaultStore: imgStore}
+
+		repo := "myimage"
+		tag := "tag1"
+
+		first := CreateRandomImage()
+		So(WriteImageToFileSystem(first, repo, tag, storeController), ShouldBeNil)
+		firstDigest := first.Digest()
+
+		_, _, _, err := imgStore.GetImageManifest(repo, firstDigest.String())
+		So(err, ShouldBeNil)
+
+		second := CreateRandomImage()
+		So(WriteImageToFileSystem(second, repo, tag, storeController), ShouldBeNil)
+
+		_, _, _, err = imgStore.GetImageManifest(repo, firstDigest.String())
+		So(err, ShouldBeNil)
+
+		_, _, _, err = imgStore.GetImageManifest(repo, tag)
+		So(err, ShouldBeNil)
+
+		raw, err := imgStore.GetIndexContent(repo)
+		So(err, ShouldBeNil)
+
+		var idx ispec.Index
+		So(json.Unmarshal(raw, &idx), ShouldBeNil)
+
+		untaggedOld := 0
+
+		for _, manifest := range idx.Manifests {
+			if manifest.Digest != firstDigest {
+				continue
+			}
+
+			_, hasTag := manifest.Annotations[ispec.AnnotationRefName]
+			if !hasTag {
+				untaggedOld++
+			}
+		}
+		So(untaggedOld, ShouldEqual, 1)
+	})
+
+	Convey("last tag overwrite keeps previous multi-arch index and platform digests pullable", t, func() {
+		rootDir := t.TempDir()
+		log := zlog.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+		imgStore := local.NewImageStore(rootDir, false, true, log, metrics, nil, nil, nil, nil)
+		storeController := storage.StoreController{DefaultStore: imgStore}
+
+		repo := "multi"
+		tag := "latest"
+
+		first := CreateRandomMultiarch()
+		So(WriteMultiArchImageToFileSystem(first, repo, tag, storeController), ShouldBeNil)
+		firstIndexDigest := first.Digest()
+
+		_, _, _, err := imgStore.GetImageManifest(repo, firstIndexDigest.String())
+		So(err, ShouldBeNil)
+
+		for _, img := range first.Images {
+			_, _, _, err = imgStore.GetImageManifest(repo, img.DigestStr())
+			So(err, ShouldBeNil)
+		}
+
+		second := CreateRandomMultiarch()
+		So(WriteMultiArchImageToFileSystem(second, repo, tag, storeController), ShouldBeNil)
+
+		_, _, _, err = imgStore.GetImageManifest(repo, firstIndexDigest.String())
+		So(err, ShouldBeNil)
+
+		for _, img := range first.Images {
+			_, _, _, err = imgStore.GetImageManifest(repo, img.DigestStr())
+			So(err, ShouldBeNil)
+		}
+	})
+
+	Convey("overwrite when another tag still references old digest does not add untagged duplicate", t, func() {
+		rootDir := t.TempDir()
+		log := zlog.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+		imgStore := local.NewImageStore(rootDir, false, true, log, metrics, nil, nil, nil, nil)
+		storeController := storage.StoreController{DefaultStore: imgStore}
+
+		repo := "shared"
+		image := CreateRandomImage()
+		So(WriteImageToFileSystem(image, repo, "keep", storeController), ShouldBeNil)
+		So(WriteImageToFileSystem(image, repo, "move", storeController), ShouldBeNil)
+
+		replacement := CreateRandomImage()
+		So(WriteImageToFileSystem(replacement, repo, "move", storeController), ShouldBeNil)
+
+		_, _, _, err := imgStore.GetImageManifest(repo, image.DigestStr())
+		So(err, ShouldBeNil)
+
+		raw, err := imgStore.GetIndexContent(repo)
+		So(err, ShouldBeNil)
+
+		var idx ispec.Index
+		So(json.Unmarshal(raw, &idx), ShouldBeNil)
+
+		entriesForOld := 0
+		untaggedForOld := 0
+
+		for _, manifest := range idx.Manifests {
+			if manifest.Digest != image.Digest() {
+				continue
+			}
+
+			entriesForOld++
+			if _, hasTag := manifest.Annotations[ispec.AnnotationRefName]; !hasTag {
+				untaggedForOld++
+			}
+		}
+		So(entriesForOld, ShouldEqual, 1)
+		So(untaggedForOld, ShouldEqual, 0)
+	})
+}
+
 func TestDeleteImageManifestEvents(t *testing.T) {
 	Convey("delete by tag emits ImageDeleted with manifest digest and tag reference", t, func() {
 		eventCapture := &mocks.EventRecorderMock{}
@@ -610,8 +732,7 @@ func TestDeleteImageManifestEvents(t *testing.T) {
 		_, _, err = imgStore.FullBlobUpload(context.Background(), repo, bytes.NewReader(layerBytes), layerDigest)
 		So(err, ShouldBeNil)
 
-		manifest := ispec.Manifest{}
-		manifest.SchemaVersion = 2
+		manifest := ispec.Manifest{SchemaVersion: 2}
 		manifest.Config = ispec.Descriptor{
 			MediaType: "application/vnd.oci.image.config.v1+json",
 			Digest:    cdigest,
@@ -656,8 +777,7 @@ func TestDeleteImageManifestEvents(t *testing.T) {
 		_, _, err = imgStore.FullBlobUpload(context.Background(), repo, bytes.NewReader(layerBytes), layerDigest)
 		So(err, ShouldBeNil)
 
-		manifest := ispec.Manifest{}
-		manifest.SchemaVersion = 2
+		manifest := ispec.Manifest{SchemaVersion: 2}
 		manifest.Config = ispec.Descriptor{
 			MediaType: "application/vnd.oci.image.config.v1+json",
 			Digest:    cdigest,
@@ -701,8 +821,7 @@ func TestDeleteImageManifestEvents(t *testing.T) {
 		_, _, err = imgStore.FullBlobUpload(context.Background(), repo, bytes.NewReader(layerBytes), layerDigest)
 		So(err, ShouldBeNil)
 
-		manifest := ispec.Manifest{}
-		manifest.SchemaVersion = 2
+		manifest := ispec.Manifest{SchemaVersion: 2}
 		manifest.Config = ispec.Descriptor{
 			MediaType: "application/vnd.oci.image.config.v1+json",
 			Digest:    cdigest,
@@ -747,8 +866,7 @@ func TestImageLintFailedEvents(t *testing.T) {
 		_, _, err = imgStore.FullBlobUpload(context.Background(), repo, bytes.NewReader(layerBytes), layerDigest)
 		So(err, ShouldBeNil)
 
-		manifest := ispec.Manifest{}
-		manifest.SchemaVersion = 2
+		manifest := ispec.Manifest{SchemaVersion: 2}
 		manifest.Config = ispec.Descriptor{
 			MediaType: "application/vnd.oci.image.config.v1+json",
 			Digest:    cdigest,
@@ -1186,8 +1304,7 @@ func TestStorageAPIs(t *testing.T) {
 						err = blob.Close()
 						So(err, ShouldBeNil)
 
-						manifest := ispec.Manifest{}
-						manifest.SchemaVersion = 2
+						manifest := ispec.Manifest{SchemaVersion: 2}
 						manifestBuf, err := json.Marshal(manifest)
 						So(err, ShouldBeNil)
 
@@ -1231,6 +1348,7 @@ func TestStorageAPIs(t *testing.T) {
 							annotationsMap := make(map[string]string)
 							annotationsMap[ispec.AnnotationRefName] = "1.0"
 							manifest := ispec.Manifest{
+								SchemaVersion: 2,
 								Config: ispec.Descriptor{
 									MediaType: "application/vnd.oci.image.config.v1+json",
 									Digest:    cdigest,
@@ -1245,8 +1363,6 @@ func TestStorageAPIs(t *testing.T) {
 								},
 								Annotations: annotationsMap,
 							}
-
-							manifest.SchemaVersion = 2
 							manifestBuf, err = json.Marshal(manifest)
 							So(err, ShouldBeNil)
 
@@ -1428,8 +1544,7 @@ func TestStorageAPIs(t *testing.T) {
 						_, err = imgStore.GetBlobContent("inexistent", digest)
 						So(err, ShouldNotBeNil)
 
-						manifest := ispec.Manifest{}
-						manifest.SchemaVersion = 2
+						manifest := ispec.Manifest{SchemaVersion: 2}
 						manifestBuf, err := json.Marshal(manifest)
 						So(err, ShouldBeNil)
 
@@ -1468,6 +1583,7 @@ func TestStorageAPIs(t *testing.T) {
 							So(hasBlob, ShouldEqual, true)
 
 							manifest := ispec.Manifest{
+								SchemaVersion: 2,
 								Config: ispec.Descriptor{
 									MediaType: "application/vnd.oci.image.config.v1+json",
 									Digest:    cdigest,
@@ -1481,7 +1597,6 @@ func TestStorageAPIs(t *testing.T) {
 									},
 								},
 							}
-							manifest.SchemaVersion = 2
 							manifestBuf, err = json.Marshal(manifest)
 							So(err, ShouldBeNil)
 
@@ -1570,6 +1685,7 @@ func TestStorageAPIs(t *testing.T) {
 					So(hasBlob, ShouldEqual, true)
 
 					manifest := ispec.Manifest{
+						SchemaVersion: 2,
 						Config: ispec.Descriptor{
 							MediaType: "application/vnd.oci.image.config.v1+json",
 							Digest:    cdigest,
@@ -1583,7 +1699,6 @@ func TestStorageAPIs(t *testing.T) {
 							},
 						},
 					}
-					manifest.SchemaVersion = 2
 					manifestBuf, err := json.Marshal(manifest)
 					So(err, ShouldBeNil)
 
@@ -1638,8 +1753,9 @@ func TestStorageAPIs(t *testing.T) {
 								Size:      int64(buflen),
 							},
 						},
+
+						SchemaVersion: 2,
 					}
-					manifest.SchemaVersion = 2
 					manifestBuf, err = json.Marshal(manifest)
 					So(err, ShouldBeNil)
 
@@ -1786,6 +1902,7 @@ func TestMandatoryAnnotations(t *testing.T) {
 				annotationsMap[ispec.AnnotationRefName] = "1.0"
 
 				manifest := ispec.Manifest{
+					SchemaVersion: 2,
 					Config: ispec.Descriptor{
 						MediaType: "application/vnd.oci.image.config.v1+json",
 						Digest:    cdigest,
@@ -1800,8 +1917,6 @@ func TestMandatoryAnnotations(t *testing.T) {
 					},
 					Annotations: annotationsMap,
 				}
-
-				manifest.SchemaVersion = 2
 				manifestBuf, err := json.Marshal(manifest)
 				So(err, ShouldBeNil)
 
@@ -2072,12 +2187,18 @@ func TestDeleteBlobsInUse(t *testing.T) {
 			}
 
 			Convey("Setup manifest", t, func() {
+				// Unique repo per GoConvey leaf: parent Setup re-runs for each nested
+				// Convey, and last-tag overwrite retains prior digests in index.json.
+				repoUUID, err := guuid.NewV4()
+				So(err, ShouldBeNil)
+				repo := "repo-" + repoUUID.String()
+
 				// put an unused blob
 				content := []byte("unused blob")
 				buf := bytes.NewBuffer(content)
 				unusedDigest := godigest.FromBytes(content)
 
-				_, _, err := imgStore.FullBlobUpload(context.Background(), "repo", bytes.NewReader(buf.Bytes()), unusedDigest)
+				_, _, err = imgStore.FullBlobUpload(context.Background(), repo, bytes.NewReader(buf.Bytes()), unusedDigest)
 				So(err, ShouldBeNil)
 
 				content = []byte("test-data1")
@@ -2085,11 +2206,11 @@ func TestDeleteBlobsInUse(t *testing.T) {
 				buflen := buf.Len()
 				digest := godigest.FromBytes(content)
 
-				_, _, err = imgStore.FullBlobUpload(context.Background(), "repo", bytes.NewReader(buf.Bytes()), digest)
+				_, _, err = imgStore.FullBlobUpload(context.Background(), repo, bytes.NewReader(buf.Bytes()), digest)
 				So(err, ShouldBeNil)
 
 				cblob, cdigest := GetRandomImageConfig()
-				_, clen, err := imgStore.FullBlobUpload(context.Background(), "repo", bytes.NewReader(cblob), cdigest)
+				_, clen, err := imgStore.FullBlobUpload(context.Background(), repo, bytes.NewReader(cblob), cdigest)
 				So(err, ShouldBeNil)
 				So(clen, ShouldEqual, len(cblob))
 
@@ -2097,6 +2218,7 @@ func TestDeleteBlobsInUse(t *testing.T) {
 				annotationsMap[ispec.AnnotationRefName] = tag
 
 				manifest := ispec.Manifest{
+					SchemaVersion: 2,
 					Config: ispec.Descriptor{
 						MediaType: "application/vnd.oci.image.config.v1+json",
 						Digest:    cdigest,
@@ -2111,70 +2233,68 @@ func TestDeleteBlobsInUse(t *testing.T) {
 					},
 					Annotations: annotationsMap,
 				}
-
-				manifest.SchemaVersion = 2
 				manifestBuf, err := json.Marshal(manifest)
 				So(err, ShouldBeNil)
 
 				manifestDigest, _, err := imgStore.PutImageManifest(context.Background(),
-					"repo", tag, ispec.MediaTypeImageManifest, manifestBuf, nil)
+					repo, tag, ispec.MediaTypeImageManifest, manifestBuf, nil)
 				So(err, ShouldBeNil)
 
 				Convey("Try to delete blob currently in use", func() {
 					// layer blob
-					err := imgStore.DeleteBlob("repo", digest)
+					err := imgStore.DeleteBlob(repo, digest)
 					So(err, ShouldEqual, zerr.ErrBlobReferenced)
 
 					// manifest
-					err = imgStore.DeleteBlob("repo", manifestDigest)
+					err = imgStore.DeleteBlob(repo, manifestDigest)
 					So(err, ShouldEqual, zerr.ErrBlobReferenced)
 
 					// config
-					err = imgStore.DeleteBlob("repo", cdigest)
+					err = imgStore.DeleteBlob(repo, cdigest)
 					So(err, ShouldEqual, zerr.ErrBlobReferenced)
 				})
 
 				Convey("Delete unused blob", func() {
-					err := imgStore.DeleteBlob("repo", unusedDigest)
+					err := imgStore.DeleteBlob(repo, unusedDigest)
 					So(err, ShouldBeNil)
 				})
 
 				Convey("Delete manifest first, then blob", func() {
-					err := imgStore.DeleteImageManifest(context.Background(), "repo", manifestDigest.String(), false)
+					err := imgStore.DeleteImageManifest(context.Background(), repo, manifestDigest.String(), false)
 					So(err, ShouldBeNil)
 
-					err = imgStore.DeleteBlob("repo", digest)
+					err = imgStore.DeleteBlob(repo, digest)
 					So(err, ShouldBeNil)
 
 					// config
-					err = imgStore.DeleteBlob("repo", cdigest)
+					err = imgStore.DeleteBlob(repo, cdigest)
 					So(err, ShouldBeNil)
 				})
 
 				if testcase.storageType == storageConstants.LocalStorageDriverName {
 					Convey("get image manifest error", func() {
-						err := os.Chmod(path.Join(imgStore.RootDir(), "repo", "blobs", "sha256", manifestDigest.Encoded()), 0o000)
+						err := os.Chmod(path.Join(imgStore.RootDir(), repo, "blobs", "sha256", manifestDigest.Encoded()), 0o000)
 						So(err, ShouldBeNil)
 
-						ok, err := storageCommon.IsBlobReferenced(imgStore, "repo", unusedDigest, log)
+						ok, err := storageCommon.IsBlobReferenced(imgStore, repo, unusedDigest, log)
 						So(err, ShouldNotBeNil)
 						So(ok, ShouldBeFalse)
 
-						err = os.Chmod(path.Join(imgStore.RootDir(), "repo", "blobs", "sha256", manifestDigest.Encoded()), 0o755)
+						err = os.Chmod(path.Join(imgStore.RootDir(), repo, "blobs", "sha256", manifestDigest.Encoded()), 0o755)
 						So(err, ShouldBeNil)
 					})
 
 					Convey("DeleteBlob fails closed when reference check errors", func() {
-						err := os.Chmod(path.Join(imgStore.RootDir(), "repo", "blobs", "sha256", manifestDigest.Encoded()), 0o000)
+						err := os.Chmod(path.Join(imgStore.RootDir(), repo, "blobs", "sha256", manifestDigest.Encoded()), 0o000)
 						So(err, ShouldBeNil)
 
-						err = imgStore.DeleteBlob("repo", digest)
+						err = imgStore.DeleteBlob(repo, digest)
 						So(err, ShouldNotBeNil)
 
-						err = os.Chmod(path.Join(imgStore.RootDir(), "repo", "blobs", "sha256", manifestDigest.Encoded()), 0o755)
+						err = os.Chmod(path.Join(imgStore.RootDir(), repo, "blobs", "sha256", manifestDigest.Encoded()), 0o755)
 						So(err, ShouldBeNil)
 
-						ok, _, err := imgStore.CheckBlob(context.Background(), "repo", digest)
+						ok, _, err := imgStore.CheckBlob(context.Background(), repo, digest)
 						So(err, ShouldBeNil)
 						So(ok, ShouldBeTrue)
 					})
@@ -2182,12 +2302,17 @@ func TestDeleteBlobsInUse(t *testing.T) {
 			})
 
 			Convey("Setup multiarch manifest", t, func() {
+				// Unique repo per GoConvey leaf (same reason as Setup manifest above).
+				repoUUID, err := guuid.NewV4()
+				So(err, ShouldBeNil)
+				repoName := "test-" + repoUUID.String()
+
 				// put an unused blob
 				content := []byte("unused blob")
 				buf := bytes.NewBuffer(content)
 				unusedDigest := godigest.FromBytes(content)
 
-				_, _, err := imgStore.FullBlobUpload(context.Background(), repoName, bytes.NewReader(buf.Bytes()), unusedDigest)
+				_, _, err = imgStore.FullBlobUpload(context.Background(), repoName, bytes.NewReader(buf.Bytes()), unusedDigest)
 				So(err, ShouldBeNil)
 
 				// create a blob/layer
@@ -2240,6 +2365,7 @@ func TestDeleteBlobsInUse(t *testing.T) {
 
 					// create a manifest
 					manifest := ispec.Manifest{
+						SchemaVersion: 2,
 						Config: ispec.Descriptor{
 							MediaType: ispec.MediaTypeImageConfig,
 							Digest:    cdigest,
@@ -2253,7 +2379,6 @@ func TestDeleteBlobsInUse(t *testing.T) {
 							},
 						},
 					}
-					manifest.SchemaVersion = 2
 					content, err = json.Marshal(manifest)
 					So(err, ShouldBeNil)
 
@@ -2311,15 +2436,15 @@ func TestDeleteBlobsInUse(t *testing.T) {
 
 				Convey("Try to delete blob currently in use", func() {
 					// layer blob
-					err := imgStore.DeleteBlob("test", bdgst1)
+					err := imgStore.DeleteBlob(repoName, bdgst1)
 					So(err, ShouldEqual, zerr.ErrBlobReferenced)
 
 					// manifest
-					err = imgStore.DeleteBlob("test", digest)
+					err = imgStore.DeleteBlob(repoName, digest)
 					So(err, ShouldEqual, zerr.ErrBlobReferenced)
 
 					// config
-					err = imgStore.DeleteBlob("test", cdigest)
+					err = imgStore.DeleteBlob(repoName, cdigest)
 					So(err, ShouldEqual, zerr.ErrBlobReferenced)
 				})
 
@@ -2341,7 +2466,7 @@ func TestDeleteBlobsInUse(t *testing.T) {
 					So(err, ShouldBeNil)
 
 					// config
-					err = imgStore.DeleteBlob("test", cdigest)
+					err = imgStore.DeleteBlob(repoName, cdigest)
 					So(err, ShouldBeNil)
 				})
 
@@ -2593,6 +2718,208 @@ func TestReuploadCorruptedBlob(t *testing.T) {
 	}
 }
 
+func TestReuploadEqualSizeCorruptedManifest(t *testing.T) {
+	Convey("Equal-size corrupted manifests are repaired", t, func() {
+		for _, reference := range []string{"1.0", "digest"} {
+			Convey(reference, func() {
+				rootDir := t.TempDir()
+				log := zlog.NewTestLogger()
+				metrics := monitoring.NewNopMetricServer()
+				imgStore := local.NewImageStore(rootDir, false, true, log, metrics, nil, nil, nil, nil)
+				storeController := storage.StoreController{DefaultStore: imgStore}
+
+				image := CreateRandomImage()
+				image.Manifest.Annotations = map[string]string{"probe": "good"}
+				So(WriteImageToFileSystem(image, repoName, "1.0", storeController), ShouldBeNil)
+
+				manifestBody, manifestDigest, mediaType, err := imgStore.GetImageManifest(repoName, "1.0")
+				So(err, ShouldBeNil)
+				So(imgStore.VerifyBlobDigestValue(repoName, manifestDigest), ShouldBeNil)
+
+				corruptedBody := bytes.Replace(manifestBody, []byte("good"), []byte("baad"), 1)
+				So(corruptedBody, ShouldNotResemble, manifestBody)
+				So(len(corruptedBody), ShouldEqual, len(manifestBody))
+
+				manifestPath := imgStore.BlobPath(repoName, manifestDigest)
+				storeDriver := local.New(true)
+				_, err = storeDriver.WriteFile(manifestPath, corruptedBody)
+				So(err, ShouldBeNil)
+				So(imgStore.VerifyBlobDigestValue(repoName, manifestDigest), ShouldEqual, zerr.ErrBadBlobDigest)
+
+				requestReference := "1.0"
+				if reference == "digest" {
+					requestReference = manifestDigest.String()
+				}
+
+				_, _, err = imgStore.PutImageManifest(context.Background(), repoName, requestReference,
+					mediaType, manifestBody, nil)
+				So(err, ShouldBeNil)
+
+				storedBody, err := storeDriver.ReadFile(manifestPath)
+				So(err, ShouldBeNil)
+				So(storedBody, ShouldResemble, manifestBody)
+				So(imgStore.VerifyBlobDigestValue(repoName, manifestDigest), ShouldBeNil)
+			})
+		}
+	})
+}
+
+type recordingMetricServer struct {
+	sendMetricCalls      int
+	forceSendMetricCalls int
+}
+
+func (m *recordingMetricServer) SendMetric(any) {
+	m.sendMetricCalls++
+}
+
+func (m *recordingMetricServer) ForceSendMetric(any) {
+	m.forceSendMetricCalls++
+}
+
+func (*recordingMetricServer) ReceiveMetrics() any {
+	return nil
+}
+
+func (*recordingMetricServer) IsEnabled() bool {
+	return true
+}
+
+func (*recordingMetricServer) Stop() {}
+
+func TestReuploadMissingManifestRecordsMetrics(t *testing.T) {
+	Convey("A missing manifest repaired by re-upload records success metrics", t, func() {
+		const repo = "manifest-missing"
+
+		rootDir := t.TempDir()
+		log := zlog.NewTestLogger()
+		metrics := &recordingMetricServer{}
+		storeDriver := local.New(true)
+
+		cacheDriver, err := storage.Create("boltdb", cache.BoltDBDriverParameters{
+			RootDir:     rootDir,
+			Name:        "cache",
+			UseRelPaths: true,
+		}, log)
+		So(err, ShouldBeNil)
+
+		imgStore := imagestore.NewImageStore(rootDir, rootDir, true, true, log, metrics, nil,
+			storeDriver, cacheDriver, nil, nil)
+		storeController := storage.StoreController{DefaultStore: imgStore}
+		image := CreateRandomImage()
+
+		So(WriteImageToFileSystem(image, repo, "1.0", storeController), ShouldBeNil)
+
+		manifestBody, manifestDigest, mediaType, err := imgStore.GetImageManifest(repo, "1.0")
+		So(err, ShouldBeNil)
+		manifestPath := imgStore.BlobPath(repo, manifestDigest)
+		sendMetricCalls := metrics.sendMetricCalls
+		forceSendMetricCalls := metrics.forceSendMetricCalls
+
+		So(storeDriver.Delete(manifestPath), ShouldBeNil)
+
+		_, _, err = imgStore.PutImageManifest(context.Background(), repo, "1.0", mediaType, manifestBody, nil)
+		So(err, ShouldBeNil)
+		So(imgStore.VerifyBlobDigestValue(repo, manifestDigest), ShouldBeNil)
+		// Re-upload emits two lock-latency metrics and one upload metric.
+		So(metrics.sendMetricCalls, ShouldEqual, sendMetricCalls+3)
+		So(metrics.forceSendMetricCalls, ShouldEqual, forceSendMetricCalls+1)
+	})
+}
+
+func TestReuploadEqualSizeCorruptedManifestWithDedupe(t *testing.T) {
+	Convey("Equal-size corrupted hard-linked manifests are repaired for every repository", t, func() {
+		const (
+			repoA = "manifest-dedupe-a"
+			repoB = "manifest-dedupe-b"
+		)
+
+		storeDriver := local.New(true)
+		_, imgStore, cleanup := newLocalImageStoreWithDriver(t, storeDriver)
+		defer cleanup()
+
+		storeController := storage.StoreController{DefaultStore: imgStore}
+		image := CreateRandomImage()
+		image.Manifest.Annotations = map[string]string{"probe": "good"}
+
+		So(WriteImageToFileSystem(image, repoA, "1.0", storeController), ShouldBeNil)
+		So(WriteImageToFileSystem(image, repoB, "1.0", storeController), ShouldBeNil)
+
+		manifestBody, manifestDigest, mediaType, err := imgStore.GetImageManifest(repoA, "1.0")
+		So(err, ShouldBeNil)
+
+		manifestPathA := imgStore.BlobPath(repoA, manifestDigest)
+		manifestPathB := imgStore.BlobPath(repoB, manifestDigest)
+		So(storeDriver.Link(manifestPathA, manifestPathB), ShouldBeNil)
+		So(storeDriver.SameFile(manifestPathA, manifestPathB), ShouldBeTrue)
+
+		corruptedBody := bytes.Replace(manifestBody, []byte("good"), []byte("baad"), 1)
+		So(corruptedBody, ShouldNotResemble, manifestBody)
+		So(len(corruptedBody), ShouldEqual, len(manifestBody))
+
+		_, err = storeDriver.WriteFile(manifestPathA, corruptedBody)
+		So(err, ShouldBeNil)
+		So(imgStore.VerifyBlobDigestValue(repoA, manifestDigest), ShouldEqual, zerr.ErrBadBlobDigest)
+		So(imgStore.VerifyBlobDigestValue(repoB, manifestDigest), ShouldEqual, zerr.ErrBadBlobDigest)
+
+		_, _, err = imgStore.PutImageManifest(context.Background(), repoA, "1.0", mediaType, manifestBody, nil)
+		So(err, ShouldBeNil)
+
+		storedBodyA, err := storeDriver.ReadFile(manifestPathA)
+		So(err, ShouldBeNil)
+		So(storedBodyA, ShouldResemble, manifestBody)
+
+		storedBodyB, err := storeDriver.ReadFile(manifestPathB)
+		So(err, ShouldBeNil)
+		So(storedBodyB, ShouldResemble, manifestBody)
+		So(storeDriver.SameFile(manifestPathA, manifestPathB), ShouldBeTrue)
+		So(imgStore.VerifyBlobDigestValue(repoA, manifestDigest), ShouldBeNil)
+		So(imgStore.VerifyBlobDigestValue(repoB, manifestDigest), ShouldBeNil)
+	})
+}
+
+func TestReuploadManifestShortWrite(t *testing.T) {
+	Convey("A short manifest repair write returns an error", t, func() {
+		const repo = "manifest-short-write"
+
+		baseDriver := local.New(true)
+		hookDriver := &stagingHookDriver{Driver: baseDriver}
+		_, imgStore, cleanup := newLocalImageStoreWithDriver(t, hookDriver)
+		defer cleanup()
+
+		storeController := storage.StoreController{DefaultStore: imgStore}
+		image := CreateRandomImage()
+		image.Manifest.Annotations = map[string]string{"probe": "good"}
+		So(WriteImageToFileSystem(image, repo, "1.0", storeController), ShouldBeNil)
+
+		manifestBody, manifestDigest, mediaType, err := imgStore.GetImageManifest(repo, "1.0")
+		So(err, ShouldBeNil)
+
+		corruptedBody := bytes.Replace(manifestBody, []byte("good"), []byte("baad"), 1)
+		So(corruptedBody, ShouldNotResemble, manifestBody)
+		So(len(corruptedBody), ShouldEqual, len(manifestBody))
+
+		manifestPath := imgStore.BlobPath(repo, manifestDigest)
+		_, err = baseDriver.WriteFile(manifestPath, corruptedBody)
+		So(err, ShouldBeNil)
+
+		hookDriver.writeFileHook = func(filePath string, content []byte) (int, error, bool) {
+			if filePath == manifestPath {
+				return len(content) - 1, nil, true
+			}
+
+			return 0, nil, false
+		}
+
+		_, _, err = imgStore.PutImageManifest(context.Background(), repo, "1.0", mediaType, manifestBody, nil)
+		So(errors.Is(err, io.ErrShortWrite), ShouldBeTrue)
+
+		storedBody, err := baseDriver.ReadFile(manifestPath)
+		So(err, ShouldBeNil)
+		So(storedBody, ShouldResemble, corruptedBody)
+	})
+}
+
 func TestStorageHandler(t *testing.T) {
 	for _, testcase := range testCases {
 		t.Run(testcase.testCaseName, func(t *testing.T) {
@@ -2820,6 +3147,7 @@ func TestGarbageCollectImageManifest(t *testing.T) {
 					So(hasBlob, ShouldEqual, true)
 
 					manifest := ispec.Manifest{
+						SchemaVersion: 2,
 						Config: ispec.Descriptor{
 							MediaType: "application/vnd.oci.image.config.v1+json",
 							Digest:    cdigest,
@@ -2834,8 +3162,6 @@ func TestGarbageCollectImageManifest(t *testing.T) {
 						},
 						Annotations: annotationsMap,
 					}
-
-					manifest.SchemaVersion = 2
 					manifestBuf, err := json.Marshal(manifest)
 					So(err, ShouldBeNil)
 
@@ -2877,8 +3203,9 @@ func TestGarbageCollectImageManifest(t *testing.T) {
 							Digest:    digest,
 							Size:      int64(len(manifestBuf)),
 						},
+
+						SchemaVersion: 2,
 					}
-					artifactManifest.SchemaVersion = 2
 
 					artifactManifestBuf, err := json.Marshal(artifactManifest)
 					So(err, ShouldBeNil)
@@ -3021,6 +3348,7 @@ func TestGarbageCollectImageManifest(t *testing.T) {
 					So(hasBlob, ShouldEqual, true)
 
 					manifest := ispec.Manifest{
+						SchemaVersion: 2,
 						Config: ispec.Descriptor{
 							MediaType: "application/vnd.oci.image.config.v1+json",
 							Digest:    cdigest,
@@ -3035,8 +3363,6 @@ func TestGarbageCollectImageManifest(t *testing.T) {
 						},
 						Annotations: annotationsMap,
 					}
-
-					manifest.SchemaVersion = 2
 					manifestBuf, err := json.Marshal(manifest)
 					So(err, ShouldBeNil)
 
@@ -3075,8 +3401,9 @@ func TestGarbageCollectImageManifest(t *testing.T) {
 							Digest:    digest,
 							Size:      int64(len(manifestBuf)),
 						},
+
+						SchemaVersion: 2,
 					}
-					artifactManifest.SchemaVersion = 2
 
 					artifactManifestBuf, err := json.Marshal(artifactManifest)
 					So(err, ShouldBeNil)
@@ -3295,6 +3622,7 @@ func TestGarbageCollectImageManifest(t *testing.T) {
 					So(hasBlob, ShouldEqual, true)
 
 					manifest := ispec.Manifest{
+						SchemaVersion: 2,
 						Config: ispec.Descriptor{
 							MediaType: "application/vnd.oci.image.config.v1+json",
 							Digest:    cdigest,
@@ -3309,8 +3637,6 @@ func TestGarbageCollectImageManifest(t *testing.T) {
 						},
 						Annotations: annotationsMap,
 					}
-
-					manifest.SchemaVersion = 2
 					manifestBuf, err := json.Marshal(manifest)
 					So(err, ShouldBeNil)
 
@@ -3373,9 +3699,9 @@ func TestGarbageCollectImageManifest(t *testing.T) {
 							},
 						},
 						Annotations: annotationsMap,
-					}
 
-					manifest.SchemaVersion = 2
+						SchemaVersion: 2,
+					}
 					manifestBuf, err = json.Marshal(manifest)
 					So(err, ShouldBeNil)
 
@@ -3431,9 +3757,9 @@ func TestGarbageCollectImageManifest(t *testing.T) {
 							},
 						},
 						Annotations: annotationsMap,
-					}
 
-					manifest.SchemaVersion = 2
+						SchemaVersion: 2,
+					}
 					manifestBuf, err = json.Marshal(manifest)
 					So(err, ShouldBeNil)
 
@@ -3561,8 +3887,9 @@ func TestGarbageCollectImageIndex(t *testing.T) {
 							Digest:    indexDigest,
 							Size:      indexSize,
 						},
+
+						SchemaVersion: 2,
 					}
-					artifactManifest.SchemaVersion = 2
 
 					artifactManifestBuf, err := json.Marshal(artifactManifest)
 					So(err, ShouldBeNil)
@@ -3726,8 +4053,9 @@ func TestGarbageCollectImageIndex(t *testing.T) {
 							Size:      indexSize,
 						},
 						ArtifactType: "application/forIndex",
+
+						SchemaVersion: 2,
 					}
-					artifactManifest.SchemaVersion = 2
 
 					artifactManifestBuf, err := json.Marshal(artifactManifest)
 					So(err, ShouldBeNil)
@@ -4052,6 +4380,7 @@ func TestGarbageCollectChainedImageIndexes(t *testing.T) {
 
 					// create a manifest
 					manifest := ispec.Manifest{
+						SchemaVersion: 2,
 						Config: ispec.Descriptor{
 							MediaType: ispec.MediaTypeImageConfig,
 							Digest:    cdigest,
@@ -4065,7 +4394,6 @@ func TestGarbageCollectChainedImageIndexes(t *testing.T) {
 							},
 						},
 					}
-					manifest.SchemaVersion = 2
 					content, err = json.Marshal(manifest)
 					So(err, ShouldBeNil)
 
@@ -4099,8 +4427,9 @@ func TestGarbageCollectChainedImageIndexes(t *testing.T) {
 							Size:      int64(len(content)),
 						},
 						ArtifactType: "application/forManifestInInnerIndex",
+
+						SchemaVersion: 2,
 					}
-					artifactManifest.SchemaVersion = 2
 
 					artifactManifestBuf, err := json.Marshal(artifactManifest)
 					So(err, ShouldBeNil)
@@ -4138,6 +4467,7 @@ func TestGarbageCollectChainedImageIndexes(t *testing.T) {
 
 					// create a manifest
 					manifest := ispec.Manifest{
+						SchemaVersion: 2,
 						Config: ispec.Descriptor{
 							MediaType: ispec.MediaTypeImageConfig,
 							Digest:    cdigest,
@@ -4151,7 +4481,6 @@ func TestGarbageCollectChainedImageIndexes(t *testing.T) {
 							},
 						},
 					}
-					manifest.SchemaVersion = 2
 					content, err = json.Marshal(manifest)
 					So(err, ShouldBeNil)
 
@@ -4215,8 +4544,9 @@ func TestGarbageCollectChainedImageIndexes(t *testing.T) {
 						Size:      int64(len(indexContent)),
 					},
 					ArtifactType: "application/forIndex",
+
+					SchemaVersion: 2,
 				}
-				artifactManifest.SchemaVersion = 2
 
 				artifactManifestBuf, err := json.Marshal(artifactManifest)
 				So(err, ShouldBeNil)
@@ -4452,6 +4782,7 @@ func pushRandomImageIndex(imgStore storageTypes.ImageStore, repoName string,
 
 		// create a manifest
 		manifest := ispec.Manifest{
+			SchemaVersion: 2,
 			Config: ispec.Descriptor{
 				MediaType: ispec.MediaTypeImageConfig,
 				Digest:    cdigest,
@@ -4465,7 +4796,6 @@ func pushRandomImageIndex(imgStore storageTypes.ImageStore, repoName string,
 				},
 			},
 		}
-		manifest.SchemaVersion = 2
 		content, err = json.Marshal(manifest)
 		So(err, ShouldBeNil)
 
@@ -4564,15 +4894,15 @@ func DumpKeys(t *testing.T, redisURL string) {
 	}
 }
 
-// putIndexHookDriver wraps the local driver so PutIndexContent tests can inject WriteFile / Move failures.
-type putIndexHookDriver struct {
+// stagingHookDriver wraps the local driver so staged-write tests can inject WriteFile / Move failures.
+type stagingHookDriver struct {
 	*local.Driver
 
 	writeFileHook func(filePath string, content []byte) (n int, err error, handled bool)
 	moveHook      func(src, dst string) (err error, handled bool)
 }
 
-func (h *putIndexHookDriver) WriteFile(filePath string, content []byte) (int, error) {
+func (h *stagingHookDriver) WriteFile(filePath string, content []byte) (int, error) {
 	if h.writeFileHook != nil {
 		if n, err, ok := h.writeFileHook(filePath, content); ok {
 			return n, err
@@ -4582,7 +4912,7 @@ func (h *putIndexHookDriver) WriteFile(filePath string, content []byte) (int, er
 	return h.Driver.WriteFile(filePath, content)
 }
 
-func (h *putIndexHookDriver) Move(src, dst string) error {
+func (h *stagingHookDriver) Move(src, dst string) error {
 	if h.moveHook != nil {
 		if err, ok := h.moveHook(src, dst); ok {
 			return err
@@ -4597,7 +4927,7 @@ func TestPutIndexContent_atomicReplace(t *testing.T) {
 		const repo = "r1"
 
 		Convey("staging WriteFile failure leaves index.json unchanged", func() {
-			hookDriver := &putIndexHookDriver{
+			hookDriver := &stagingHookDriver{
 				Driver: local.New(true),
 				writeFileHook: func(filePath string, content []byte) (int, error, bool) {
 					if filepath.Base(filepath.Dir(filePath)) == storageConstants.BlobUploadDir {
@@ -4632,8 +4962,43 @@ func TestPutIndexContent_atomicReplace(t *testing.T) {
 			So(uploadOrphans, ShouldBeEmpty)
 		})
 
+		Convey("short staging write leaves index.json unchanged", func() {
+			hookDriver := &stagingHookDriver{
+				Driver: local.New(true),
+				writeFileHook: func(filePath string, content []byte) (int, error, bool) {
+					if filepath.Base(filepath.Dir(filePath)) == storageConstants.BlobUploadDir {
+						return len(content) - 1, nil, true
+					}
+
+					return 0, nil, false
+				},
+			}
+
+			root, imgStore, cleanup := newLocalImageStoreWithDriver(t, hookDriver)
+			defer cleanup()
+
+			So(imgStore.InitRepo(context.Background(), repo), ShouldBeNil)
+
+			before, err := os.ReadFile(path.Join(root, repo, ispec.ImageIndexFile))
+			So(err, ShouldBeNil)
+
+			var idx ispec.Index
+			So(json.Unmarshal(before, &idx), ShouldBeNil)
+			idx.SchemaVersion = 1000
+
+			So(errors.Is(imgStore.PutIndexContent(repo, idx), io.ErrShortWrite), ShouldBeTrue)
+
+			after, err := os.ReadFile(path.Join(root, repo, ispec.ImageIndexFile))
+			So(err, ShouldBeNil)
+			So(string(after), ShouldEqual, string(before))
+
+			uploadOrphans, err := filepath.Glob(path.Join(root, repo, storageConstants.BlobUploadDir, "*"))
+			So(err, ShouldBeNil)
+			So(uploadOrphans, ShouldBeEmpty)
+		})
+
 		Convey("Move into index.json failure leaves index.json unchanged", func() {
-			hookDriver := &putIndexHookDriver{
+			hookDriver := &stagingHookDriver{
 				Driver: local.New(true),
 				moveHook: func(src, dst string) (error, bool) {
 					if filepath.Base(dst) == ispec.ImageIndexFile {
@@ -4662,6 +5027,47 @@ func TestPutIndexContent_atomicReplace(t *testing.T) {
 			after, err := os.ReadFile(path.Join(root, repo, ispec.ImageIndexFile))
 			So(err, ShouldBeNil)
 			So(string(after), ShouldEqual, string(before))
+
+			uploadOrphans, err := filepath.Glob(path.Join(root, repo, storageConstants.BlobUploadDir, "*"))
+			So(err, ShouldBeNil)
+			So(uploadOrphans, ShouldBeEmpty)
+		})
+
+		Convey("Move error after replacing index.json is treated as committed", func() {
+			baseDriver := local.New(true)
+			hookDriver := &stagingHookDriver{Driver: baseDriver}
+			hookDriver.moveHook = func(src, dst string) (error, bool) {
+				if filepath.Base(dst) != ispec.ImageIndexFile {
+					return nil, false
+				}
+
+				if err := baseDriver.Move(src, dst); err != nil {
+					return err, true
+				}
+
+				//nolint: err113
+				return errors.New("forced post-commit move failure"), true
+			}
+
+			root, imgStore, cleanup := newLocalImageStoreWithDriver(t, hookDriver)
+			defer cleanup()
+
+			So(imgStore.InitRepo(context.Background(), repo), ShouldBeNil)
+
+			var idx ispec.Index
+			before, err := os.ReadFile(path.Join(root, repo, ispec.ImageIndexFile))
+			So(err, ShouldBeNil)
+			So(json.Unmarshal(before, &idx), ShouldBeNil)
+
+			idx.SchemaVersion = 43
+			So(imgStore.PutIndexContent(repo, idx), ShouldBeNil)
+
+			after, err := os.ReadFile(path.Join(root, repo, ispec.ImageIndexFile))
+			So(err, ShouldBeNil)
+
+			var got ispec.Index
+			So(json.Unmarshal(after, &got), ShouldBeNil)
+			So(got.SchemaVersion, ShouldEqual, 43)
 
 			uploadOrphans, err := filepath.Glob(path.Join(root, repo, storageConstants.BlobUploadDir, "*"))
 			So(err, ShouldBeNil)

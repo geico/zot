@@ -61,8 +61,8 @@ func TestNegativeServerResponse(t *testing.T) {
 		}
 		defaultVal := false
 		searchConfig := &extconf.SearchConfig{
-			BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
-			CVE:        cveConfig,
+			Enable: &defaultVal,
+			CVE:    cveConfig,
 		}
 		conf.Extensions = &extconf.ExtensionConfig{
 			Search: searchConfig,
@@ -135,8 +135,8 @@ func TestNegativeServerResponse(t *testing.T) {
 		}
 		defaultVal := true
 		searchConfig := &extconf.SearchConfig{
-			BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
-			CVE:        cveConfig,
+			Enable: &defaultVal,
+			CVE:    cveConfig,
 		}
 		conf.Extensions = &extconf.ExtensionConfig{
 			Search: searchConfig,
@@ -205,8 +205,8 @@ func TestCVEDiffList(t *testing.T) {
 	}
 	defaultVal := true
 	searchConfig := &extconf.SearchConfig{
-		BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
-		CVE:        cveConfig,
+		Enable: &defaultVal,
+		CVE:    cveConfig,
 	}
 	conf.Extensions = &extconf.ExtensionConfig{
 		Search: searchConfig,
@@ -324,10 +324,10 @@ func TestCVEDiffList(t *testing.T) {
 
 			return cvemodel.ScanResult{CVEMap: getCveResults(repoMeta.Tags[ref].Digest)}, nil
 		},
-		GetCachedResultFn: func(digestStr string) map[string]zcommon.CVE {
+		GetCachedResultFn: func(repo, digestStr string) map[string]zcommon.CVE {
 			return getCveResults(digestStr)
 		},
-		IsResultCachedFn: func(digestStr string) bool {
+		IsResultCachedFn: func(repo, digestStr string) bool {
 			return true
 		},
 	}
@@ -490,8 +490,8 @@ func TestServerCVEResponse(t *testing.T) {
 	}
 	defaultVal := true
 	searchConfig := &extconf.SearchConfig{
-		BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
-		CVE:        cveConfig,
+		Enable: &defaultVal,
+		CVE:    cveConfig,
 	}
 	conf.Extensions = &extconf.ExtensionConfig{
 		Search: searchConfig,
@@ -868,7 +868,7 @@ func TestCVESort(t *testing.T) {
 	defaultVal := true
 	conf.Extensions = &extconf.ExtensionConfig{
 		Search: &extconf.SearchConfig{
-			BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+			Enable: &defaultVal,
 			CVE: &extconf.CVEConfig{
 				UpdateInterval: 2,
 				Trivy: &extconf.TrivyConfig{

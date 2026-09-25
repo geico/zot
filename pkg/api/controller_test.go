@@ -38,7 +38,6 @@ import (
 	notreg "github.com/notaryproject/notation-go/registry"
 	distext "github.com/opencontainers/distribution-spec/specs-go/v1/extensions"
 	godigest "github.com/opencontainers/go-digest"
-	"github.com/opencontainers/image-spec/specs-go"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/project-zot/mockoidc"
 	"github.com/sigstore/cosign/v3/cmd/cosign/cli/generate"
@@ -868,7 +867,7 @@ func TestAllowMethodsHeader(t *testing.T) {
 
 		defaultVal := true
 		conf.Extensions = &extconf.ExtensionConfig{
-			Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+			Search: &extconf.SearchConfig{Enable: &defaultVal},
 		}
 
 		ctlr := api.NewController(conf)
@@ -3741,6 +3740,18 @@ func TestBearerAuthWithAllowReadAccess(t *testing.T) {
 		resp, err := resty.R().Get(baseURL + "/v2/")
 		So(err, ShouldBeNil)
 		So(resp, ShouldNotBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+		So(resp.Header().Get("WWW-Authenticate"), ShouldBeEmpty)
+
+		s1, seed1 := test.GenerateRandomName()
+		s2, seed2 := test.GenerateRandomName()
+		repoName := s1 + "/" + s2
+
+		ctlr.Log.Info().Int64("seed1", seed1).Int64("seed2", seed2).Msg("random seeds for repoName")
+
+		resp, err = resty.R().Post(baseURL + "/v2/" + repoName + "/blobs/uploads/")
+		So(err, ShouldBeNil)
+		So(resp, ShouldNotBeNil)
 		So(resp.StatusCode(), ShouldEqual, http.StatusUnauthorized)
 
 		authorizationHeader := authutils.ParseBearerAuthHeader(resp.Header().Get("WWW-Authenticate"))
@@ -3754,35 +3765,6 @@ func TestBearerAuthWithAllowReadAccess(t *testing.T) {
 
 		var goodToken authutils.AccessTokenResponse
 
-		err = json.Unmarshal(resp.Body(), &goodToken)
-		So(err, ShouldBeNil)
-
-		resp, err = resty.R().
-			SetHeader("Authorization", "Bearer "+goodToken.AccessToken).
-			Get(baseURL + "/v2/")
-		So(err, ShouldBeNil)
-		So(resp, ShouldNotBeNil)
-		So(resp.StatusCode(), ShouldEqual, http.StatusOK)
-
-		s1, seed1 := test.GenerateRandomName()
-		s2, seed2 := test.GenerateRandomName()
-		repoName := s1 + "/" + s2
-
-		ctlr.Log.Info().Int64("seed1", seed1).Int64("seed2", seed2).Msg("random seeds for repoName")
-
-		resp, err = resty.R().Post(baseURL + "/v2/" + repoName + "/blobs/uploads/")
-		So(err, ShouldBeNil)
-		So(resp, ShouldNotBeNil)
-		So(resp.StatusCode(), ShouldEqual, http.StatusUnauthorized)
-
-		authorizationHeader = authutils.ParseBearerAuthHeader(resp.Header().Get("WWW-Authenticate"))
-		resp, err = resty.R().
-			SetQueryParam("service", authorizationHeader.Service).
-			SetQueryParam("scope", authorizationHeader.Scope).
-			Get(authorizationHeader.Realm)
-		So(err, ShouldBeNil)
-		So(resp, ShouldNotBeNil)
-		So(resp.StatusCode(), ShouldEqual, http.StatusOK)
 		err = json.Unmarshal(resp.Body(), &goodToken)
 		So(err, ShouldBeNil)
 
@@ -3825,6 +3807,12 @@ func TestBearerAuthWithAllowReadAccess(t *testing.T) {
 		So(err, ShouldBeNil)
 		So(resp, ShouldNotBeNil)
 		So(resp.StatusCode(), ShouldEqual, http.StatusCreated)
+
+		resp, err = resty.R().
+			Get(baseURL + "/v2/" + repoName + "/tags/list")
+		So(err, ShouldBeNil)
+		So(resp, ShouldNotBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusOK)
 
 		resp, err = resty.R().
 			SetHeader("Authorization", "Bearer "+goodToken.AccessToken).
@@ -4042,12 +4030,12 @@ func TestOpenIDMiddleware(t *testing.T) {
 	}
 
 	searchConfig := &extconf.SearchConfig{
-		BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+		Enable: &defaultVal,
 	}
 
 	// UI is enabled because we also want to test access on the mgmt route
 	uiConfig := &extconf.UIConfig{
-		BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+		Enable: &defaultVal,
 	}
 
 	conf.Extensions = &extconf.ExtensionConfig{
@@ -4493,12 +4481,12 @@ func TestOpenIDMiddlewareWithRedisSessionDriver(t *testing.T) {
 	}
 
 	searchConfig := &extconf.SearchConfig{
-		BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+		Enable: &defaultVal,
 	}
 
 	// UI is enabled because we also want to test access on the mgmt route
 	uiConfig := &extconf.UIConfig{
-		BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+		Enable: &defaultVal,
 	}
 
 	conf.Extensions = &extconf.ExtensionConfig{
@@ -4999,11 +4987,11 @@ func TestAuthnSessionErrors(t *testing.T) {
 		}
 
 		uiConfig := &extconf.UIConfig{
-			BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+			Enable: &defaultVal,
 		}
 
 		searchConfig := &extconf.SearchConfig{
-			BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+			Enable: &defaultVal,
 		}
 
 		conf.Extensions = &extconf.ExtensionConfig{
@@ -5773,11 +5761,9 @@ func signBearerTestToken(t *testing.T, serverKeyPath string, access []api.Resour
 
 	now := time.Now()
 	claims := api.ClaimsWithAccess{
-		Access: access,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(now.Add(time.Hour)),
-			IssuedAt:  jwt.NewNumericDate(now),
-		},
+		Access:    access,
+		ExpiresAt: jwt.NewNumericDate(now.Add(time.Hour)),
+		IssuedAt:  jwt.NewNumericDate(now),
 	}
 
 	token, err := jwt.NewWithClaims(jwt.SigningMethodRS256, claims).SignedString(privateKey)
@@ -7205,6 +7191,7 @@ func TestAuthorizationWithOnlyAnonymousPolicy(t *testing.T) {
 		So(resp.StatusCode(), ShouldEqual, http.StatusCreated)
 
 		manifest := ispec.Manifest{
+			SchemaVersion: 2,
 			Config: ispec.Descriptor{
 				MediaType: "application/vnd.oci.image.config.v1+json",
 				Digest:    cdigest,
@@ -7218,7 +7205,6 @@ func TestAuthorizationWithOnlyAnonymousPolicy(t *testing.T) {
 				},
 			},
 		}
-		manifest.SchemaVersion = 2
 		manifestBlob, err := json.Marshal(manifest)
 		So(err, ShouldBeNil)
 
@@ -7250,6 +7236,7 @@ func TestAuthorizationWithOnlyAnonymousPolicy(t *testing.T) {
 		So(resp.StatusCode(), ShouldEqual, http.StatusCreated)
 
 		updatedManifest := ispec.Manifest{
+			SchemaVersion: 2,
 			Config: ispec.Descriptor{
 				MediaType: "application/vnd.oci.image.config.v1+json",
 				Digest:    cdigest,
@@ -7263,7 +7250,6 @@ func TestAuthorizationWithOnlyAnonymousPolicy(t *testing.T) {
 				},
 			},
 		}
-		updatedManifest.SchemaVersion = 2
 		updatedManifestBlob, err := json.Marshal(updatedManifest)
 		So(err, ShouldBeNil)
 
@@ -7375,8 +7361,8 @@ func TestAnonymousOnlyWithUIClientHeader(t *testing.T) {
 			},
 		}
 		conf.Extensions = &extconf.ExtensionConfig{
-			Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
-			UI:     &extconf.UIConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+			Search: &extconf.SearchConfig{Enable: &defaultVal},
+			UI:     &extconf.UIConfig{Enable: &defaultVal},
 		}
 
 		ctlr := makeController(conf, t.TempDir())
@@ -7415,7 +7401,7 @@ func TestAnonymousOnlyWithUIClientHeader(t *testing.T) {
 		conf.HTTP.Port = "0"
 		conf.HTTP.Auth = &config.AuthConfig{}
 		conf.Extensions = &extconf.ExtensionConfig{
-			Search: &extconf.SearchConfig{BaseConfig: extconf.BaseConfig{Enable: &defaultVal}},
+			Search: &extconf.SearchConfig{Enable: &defaultVal},
 		}
 
 		ctlr := makeController(conf, t.TempDir())
@@ -8751,9 +8737,9 @@ func TestImageSignatures(t *testing.T) {
 				&options.RootOptions{Verbose: true, Timeout: 1 * time.Minute},
 				options.KeyOpts{KeyRef: path.Join(tdir, "cosign.key"), PassFunc: generate.GetPass},
 				options.SignOptions{
-					Registry:          options.RegistryOptions{AllowInsecure: true},
-					AnnotationOptions: options.AnnotationOptions{Annotations: annotations},
-					Upload:            true,
+					Registry:    options.RegistryOptions{AllowInsecure: true},
+					Annotations: annotations,
+					Upload:      true,
 				},
 				[]string{fmt.Sprintf("localhost:%s/%s@%s", port, repoName, digest.String())})
 			So(err, ShouldBeNil)
@@ -8764,11 +8750,11 @@ func TestImageSignatures(t *testing.T) {
 			So(err, ShouldBeNil)
 
 			vrfy := verify.VerifyCommand{
-				RegistryOptions: options.RegistryOptions{AllowInsecure: true},
-				CheckClaims:     true,
-				KeyRef:          path.Join(tdir, "cosign.pub"),
-				Annotations:     amap,
-				IgnoreTlog:      true,
+				AllowInsecure: true,
+				CheckClaims:   true,
+				KeyRef:        path.Join(tdir, "cosign.pub"),
+				Annotations:   amap,
+				IgnoreTlog:    true,
 			}
 			err = vrfy.Exec(context.TODO(), []string{fmt.Sprintf("localhost:%s/%s:%s", port, repoName, "1.0")})
 			So(err, ShouldBeNil)
@@ -8779,11 +8765,11 @@ func TestImageSignatures(t *testing.T) {
 			So(err, ShouldBeNil)
 
 			vrfy = verify.VerifyCommand{
-				RegistryOptions: options.RegistryOptions{AllowInsecure: true},
-				CheckClaims:     true,
-				KeyRef:          path.Join(tdir, "cosign.pub"),
-				Annotations:     amap,
-				IgnoreTlog:      true,
+				AllowInsecure: true,
+				CheckClaims:   true,
+				KeyRef:        path.Join(tdir, "cosign.pub"),
+				Annotations:   amap,
+				IgnoreTlog:    true,
 			}
 			err = vrfy.Exec(context.TODO(), []string{fmt.Sprintf("localhost:%s/%s:%s", port, repoName, "1.0")})
 			So(err, ShouldNotBeNil)
@@ -8794,11 +8780,11 @@ func TestImageSignatures(t *testing.T) {
 			So(err, ShouldBeNil)
 
 			vrfy = verify.VerifyCommand{
-				CheckClaims:     true,
-				RegistryOptions: options.RegistryOptions{AllowInsecure: true},
-				KeyRef:          path.Join(tdir, "cosign.key"),
-				Annotations:     amap,
-				IgnoreTlog:      true,
+				CheckClaims:   true,
+				AllowInsecure: true,
+				KeyRef:        path.Join(tdir, "cosign.key"),
+				Annotations:   amap,
+				IgnoreTlog:    true,
 			}
 			err = vrfy.Exec(context.TODO(), []string{fmt.Sprintf("localhost:%s/%s:%s", port, repoName, "1.0")})
 			So(err, ShouldNotBeNil)
@@ -8820,11 +8806,11 @@ func TestImageSignatures(t *testing.T) {
 			So(err, ShouldBeNil)
 
 			vrfy = verify.VerifyCommand{
-				CheckClaims:     true,
-				RegistryOptions: options.RegistryOptions{AllowInsecure: true},
-				KeyRef:          path.Join(tdir, "cosign.pub"),
-				Annotations:     amap,
-				IgnoreTlog:      true,
+				CheckClaims:   true,
+				AllowInsecure: true,
+				KeyRef:        path.Join(tdir, "cosign.pub"),
+				Annotations:   amap,
+				IgnoreTlog:    true,
 			}
 			err = vrfy.Exec(context.TODO(), []string{fmt.Sprintf("localhost:%s/%s:%s", port, repoName, "1.0")})
 			So(err, ShouldNotBeNil)
@@ -8916,7 +8902,12 @@ func TestImageSignatures(t *testing.T) {
 				resp, err = resty.R().SetQueryParam("artifactType", notreg.ArtifactTypeNotation).Get(
 					fmt.Sprintf("%s/v2/%s/referrers/%s", baseURL, repoName, digest.String()))
 				So(err, ShouldBeNil)
-				So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+				// Missing referrer blobs are skipped (sparse-index tolerance); list is still OK.
+				So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+
+				err = json.Unmarshal(resp.Body(), &refs)
+				So(err, ShouldBeNil)
+				So(len(refs.Manifests), ShouldEqual, 0)
 
 				err = signature.VerifyWithNotation(image, tdir)
 				So(err, ShouldNotBeNil)
@@ -8955,6 +8946,7 @@ func TestManifestValidation(t *testing.T) {
 		Convey("empty layers should pass validation", func() {
 			// create a manifest
 			manifest := ispec.Manifest{
+				SchemaVersion: 2,
 				Config: ispec.Descriptor{
 					MediaType: ispec.MediaTypeImageConfig,
 					Size:      int64(len(configBlob)),
@@ -8965,7 +8957,6 @@ func TestManifestValidation(t *testing.T) {
 					"key": "val",
 				},
 			}
-			manifest.SchemaVersion = 2
 
 			mcontent, err := json.Marshal(manifest)
 			So(err, ShouldBeNil)
@@ -9004,6 +8995,7 @@ func TestManifestValidation(t *testing.T) {
 			missingLayerDigest := godigest.FromBytes(missingLayer)
 			// create a manifest
 			manifest := ispec.Manifest{
+				SchemaVersion: 2,
 				Config: ispec.Descriptor{
 					MediaType: ispec.MediaTypeImageConfig,
 					Size:      int64(len(configBlob)),
@@ -9025,7 +9017,6 @@ func TestManifestValidation(t *testing.T) {
 					"key": "val",
 				},
 			}
-			manifest.SchemaVersion = 2
 
 			mcontent, err := json.Marshal(manifest)
 			So(err, ShouldBeNil)
@@ -9039,7 +9030,8 @@ func TestManifestValidation(t *testing.T) {
 		Convey("wrong mediatype should fail validation", func() {
 			// create a manifest
 			manifest := ispec.Manifest{
-				MediaType: "bad.mediatype",
+				SchemaVersion: 2,
+				MediaType:     "bad.mediatype",
 				Config: ispec.Descriptor{
 					MediaType: ispec.MediaTypeImageConfig,
 					Size:      int64(len(configBlob)),
@@ -9056,7 +9048,6 @@ func TestManifestValidation(t *testing.T) {
 					"key": "val",
 				},
 			}
-			manifest.SchemaVersion = 2
 
 			mcontent, err := json.Marshal(manifest)
 			So(err, ShouldBeNil)
@@ -9069,17 +9060,16 @@ func TestManifestValidation(t *testing.T) {
 
 		Convey("multiarch image should pass validation", func() {
 			index := ispec.Index{
-				MediaType: ispec.MediaTypeImageIndex,
+				SchemaVersion: 2,
+				MediaType:     ispec.MediaTypeImageIndex,
 				Manifests: []ispec.Descriptor{
 					{
 						MediaType: ispec.MediaTypeImageManifest,
 						Digest:    digest,
-						Size:      int64(len((content))),
+						Size:      int64(len(content)),
 					},
 				},
 			}
-
-			index.SchemaVersion = 2
 
 			indexContent, err := json.Marshal(index)
 			So(err, ShouldBeNil)
@@ -9097,7 +9087,7 @@ func TestManifestValidation(t *testing.T) {
 					{
 						MediaType: ispec.MediaTypeImageManifest,
 						Digest:    digest,
-						Size:      int64(len((content))),
+						Size:      int64(len(content)),
 					},
 				},
 			}
@@ -9111,14 +9101,15 @@ func TestManifestValidation(t *testing.T) {
 			So(resp.StatusCode(), ShouldEqual, http.StatusBadRequest)
 		})
 
-		Convey("multiarch image with missing manifest should fail validation", func() {
+		Convey("multiarch image with missing manifest should succeed (sparse index)", func() {
 			index := ispec.Index{
-				MediaType: ispec.MediaTypeImageIndex,
+				SchemaVersion: 2,
+				MediaType:     ispec.MediaTypeImageIndex,
 				Manifests: []ispec.Descriptor{
 					{
 						MediaType: ispec.MediaTypeImageManifest,
 						Digest:    digest,
-						Size:      int64(len((content))),
+						Size:      int64(len(content)),
 					},
 					{
 						MediaType: ispec.MediaTypeImageManifest,
@@ -9128,16 +9119,38 @@ func TestManifestValidation(t *testing.T) {
 				},
 			}
 
-			index.SchemaVersion = 2
-
 			indexContent, err := json.Marshal(index)
 			So(err, ShouldBeNil)
 
 			resp, err := resty.R().SetHeader("Content-Type", ispec.MediaTypeImageIndex).
 				SetBody(indexContent).Put(baseURL + fmt.Sprintf("/v2/%s/manifests/index", repoName))
 			So(err, ShouldBeNil)
-			So(resp.StatusCode(), ShouldEqual, http.StatusBadRequest)
+			So(resp.StatusCode(), ShouldEqual, http.StatusCreated)
 		})
+	})
+}
+
+func TestDeleteManifestMissingRepo(t *testing.T) {
+	Convey("Deleting a manifest in a repository that does not exist returns 404", t, func() {
+		conf := config.New()
+		conf.HTTP.Port = "0"
+
+		ctlr := makeController(conf, t.TempDir())
+		cm := test.NewControllerManager(ctlr)
+		baseURL := cm.StartAndWait()
+
+		defer cm.StopServer()
+
+		digest := godigest.FromString("no such manifest")
+
+		resp, err := resty.R().Delete(baseURL + "/v2/nosuchrepo/manifests/" + digest.String())
+		So(err, ShouldBeNil)
+		So(resp.StatusCode(), ShouldEqual, http.StatusNotFound)
+
+		var errList apiErr.ErrorList
+		So(json.Unmarshal(resp.Body(), &errList), ShouldBeNil)
+		So(errList.Errors, ShouldNotBeEmpty)
+		So(errList.Errors[0].Code, ShouldEqual, "NAME_UNKNOWN")
 	})
 }
 
@@ -9327,6 +9340,7 @@ func TestArtifactReferences(t *testing.T) {
 
 			// create a manifest
 			manifest := ispec.Manifest{
+				SchemaVersion: 2,
 				Config: ispec.Descriptor{
 					MediaType: artifactType,
 					Digest:    cdigest,
@@ -9348,7 +9362,6 @@ func TestArtifactReferences(t *testing.T) {
 					"key": "val",
 				},
 			}
-			manifest.SchemaVersion = 2
 
 			Convey("Using invalid content", func() {
 				resp, err = resty.R().SetHeader("Content-Type", ispec.MediaTypeImageManifest).
@@ -9430,6 +9443,7 @@ func TestArtifactReferences(t *testing.T) {
 				So(resp.StatusCode(), ShouldEqual, http.StatusCreated)
 
 				manifest := ispec.Manifest{
+					SchemaVersion: 2,
 					Config: ispec.Descriptor{
 						MediaType: "application/vnd.oci.image.config.v1+json",
 						Digest:    cdigest,
@@ -9437,7 +9451,6 @@ func TestArtifactReferences(t *testing.T) {
 					},
 				}
 
-				manifest.SchemaVersion = 2
 				mcontent, err = json.Marshal(manifest)
 				So(err, ShouldBeNil)
 
@@ -10409,6 +10422,12 @@ func TestPagedRepositories(t *testing.T) {
 			last:          repoName + "9",
 			expectedRepos: []string{},
 		},
+		{
+			testCaseName:  "Test the parameter 'last' with a repo that is no longer in storage",
+			pageSize:      "2",
+			last:          repoName + "4a",
+			expectedRepos: repoNames[4:6],
+		},
 	}
 
 	for _, testCase := range testCases {
@@ -10643,6 +10662,18 @@ func TestListingTags(t *testing.T) {
 			pageSize:     "",
 			last:         "new",
 			expectedTags: []string{sigTag},
+		},
+		{
+			testCaseName: "Test the parameters 'n' and 'last' with a tag that does not exist",
+			pageSize:     "3",
+			last:         "1.5",
+			expectedTags: []string{"2", "2-test", "2.0.0"},
+		},
+		{
+			testCaseName: "Test the parameter 'last' sorting after every tag",
+			pageSize:     "",
+			last:         "zzz",
+			expectedTags: []string{},
 		},
 	}
 
@@ -11608,8 +11639,8 @@ func TestMultiarchImage(t *testing.T) {
 			So(err, ShouldBeNil)
 
 			rootIndex := ispec.Index{
-				Versioned: specs.Versioned{SchemaVersion: 2},
-				MediaType: ispec.MediaTypeImageIndex,
+				SchemaVersion: 2,
+				MediaType:     ispec.MediaTypeImageIndex,
 				Manifests: []ispec.Descriptor{
 					{
 						Digest:    index1.IndexDescriptor.Digest,
@@ -12814,8 +12845,9 @@ func TestInjectInterruptedImageManifest(t *testing.T) {
 						Size:      int64(len(content)),
 					},
 				},
+
+				SchemaVersion: 2,
 			}
-			manifest.SchemaVersion = 2
 			content, err = json.Marshal(manifest)
 			So(err, ShouldBeNil)
 
@@ -12950,8 +12982,9 @@ func TestInjectTooManyOpenFiles(t *testing.T) {
 					Size:      int64(len(content)),
 				},
 			},
+
+			SchemaVersion: 2,
 		}
-		manifest.SchemaVersion = 2
 		content, err = json.Marshal(manifest)
 		So(err, ShouldBeNil)
 
@@ -13068,7 +13101,7 @@ func TestGCSignaturesAndUntaggedManifestsWithMetaDB(t *testing.T) {
 
 			value := true
 			searchConfig := &extconf.SearchConfig{
-				BaseConfig: extconf.BaseConfig{Enable: &value},
+				Enable: &value,
 			}
 
 			// added search extensions so that metaDB is initialized and its tested in GC logic
@@ -13143,9 +13176,9 @@ func TestGCSignaturesAndUntaggedManifestsWithMetaDB(t *testing.T) {
 				&options.RootOptions{Verbose: true, Timeout: 1 * time.Minute},
 				options.KeyOpts{KeyRef: path.Join(tdir, "cosign.key"), PassFunc: generate.GetPass},
 				options.SignOptions{
-					Registry:          options.RegistryOptions{AllowInsecure: true},
-					AnnotationOptions: options.AnnotationOptions{Annotations: annotations},
-					Upload:            true,
+					Registry:    options.RegistryOptions{AllowInsecure: true},
+					Annotations: annotations,
+					Upload:      true,
 				},
 				[]string{image})
 
@@ -13558,7 +13591,7 @@ func TestSearchRoutes(t *testing.T) {
 			defaultVal := true
 
 			searchConfig := &extconf.SearchConfig{
-				BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+				Enable: &defaultVal,
 			}
 
 			conf.Extensions = &extconf.ExtensionConfig{
@@ -13695,7 +13728,7 @@ func TestSearchRoutes(t *testing.T) {
 			defaultVal := true
 
 			searchConfig := &extconf.SearchConfig{
-				BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+				Enable: &defaultVal,
 			}
 
 			conf.Extensions = &extconf.ExtensionConfig{
@@ -13775,7 +13808,7 @@ func TestSearchRoutes(t *testing.T) {
 			defaultVal := true
 
 			searchConfig := &extconf.SearchConfig{
-				BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+				Enable: &defaultVal,
 			}
 
 			conf.Extensions = &extconf.ExtensionConfig{
@@ -13839,7 +13872,7 @@ func TestSearchRoutes(t *testing.T) {
 			defaultVal := true
 
 			searchConfig := &extconf.SearchConfig{
-				BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+				Enable: &defaultVal,
 			}
 
 			conf.Extensions = &extconf.ExtensionConfig{
@@ -13905,7 +13938,7 @@ func TestSearchRoutes(t *testing.T) {
 			defaultVal := true
 
 			searchConfig := &extconf.SearchConfig{
-				BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+				Enable: &defaultVal,
 			}
 
 			conf.Extensions = &extconf.ExtensionConfig{
@@ -13969,7 +14002,7 @@ func TestSearchRoutes(t *testing.T) {
 			defaultVal := true
 
 			searchConfig := &extconf.SearchConfig{
-				BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+				Enable: &defaultVal,
 			}
 
 			conf.Extensions = &extconf.ExtensionConfig{
@@ -14020,7 +14053,7 @@ func TestSearchRoutes(t *testing.T) {
 			}
 
 			searchConfig := &extconf.SearchConfig{
-				BaseConfig: extconf.BaseConfig{Enable: &defaultVal},
+				Enable: &defaultVal,
 			}
 
 			conf.Extensions = &extconf.ExtensionConfig{
@@ -15033,6 +15066,7 @@ func RunAuthorizationTests(t *testing.T, client *resty.Client, baseURL, user str
 		So(resp.StatusCode(), ShouldEqual, http.StatusCreated)
 
 		updatedManifest := ispec.Manifest{
+			SchemaVersion: 2,
 			Config: ispec.Descriptor{
 				MediaType: "application/vnd.oci.image.config.v1+json",
 				Digest:    cdigest,
@@ -15046,7 +15080,6 @@ func RunAuthorizationTests(t *testing.T, client *resty.Client, baseURL, user str
 				},
 			},
 		}
-		updatedManifest.SchemaVersion = 2
 		updatedManifestBlob, err := json.Marshal(updatedManifest)
 		So(err, ShouldBeNil)
 
@@ -15778,6 +15811,15 @@ func TestDockerClientV2ChallengeWorkaround(t *testing.T) {
 			So(err, ShouldBeNil)
 			So(resp, ShouldNotBeNil)
 			So(resp.StatusCode(), ShouldEqual, http.StatusOK)
+
+			// Containers/image clients still need a challenge for protected write operations.
+			resp, err = resty.R().
+				SetHeader("User-Agent", "containers/5.33.0 (github.com/containers/image)").
+				Post(baseURL + "/v2/private/repo/blobs/uploads/")
+			So(err, ShouldBeNil)
+			So(resp, ShouldNotBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusUnauthorized)
+			So(resp.Header().Get("WWW-Authenticate"), ShouldContainSubstring, "Basic realm=")
 
 			// Generic client without credentials should get 200 (unaffected)
 			resp, err = resty.R().

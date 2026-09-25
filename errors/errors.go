@@ -35,11 +35,9 @@ func NewError(err error) *Error {
 }
 
 func GetDetails(err error) map[string]string {
-	var internalErr *Error
-
 	details := make(map[string]string)
 
-	if errors.As(err, &internalErr) {
+	if internalErr, ok := errors.AsType[*Error](err); ok {
 		details = internalErr.GetDetails()
 	}
 
@@ -133,6 +131,7 @@ var (
 	ErrDedupeRebuild                    = errors.New("couldn't rebuild dedupe index")
 	ErrDedupeRebuildInProgress          = errors.New("dedupe cache rebuild in progress, blob delete deferred")
 	ErrMissingAuthHeader                = errors.New("required authorization header is missing")
+	ErrAPIKeyMetadataDBRequired         = errors.New("metadata database is required for api key authentication")
 	ErrUserAPIKeyNotFound               = errors.New("user info for given API key hash not found")
 	ErrUserSessionNotFound              = errors.New("user session for given ID not found")
 	ErrInvalidMetaDBVersion             = errors.New("unrecognized version meta")
@@ -154,6 +153,7 @@ var (
 	ErrSyncPingRegistry                 = errors.New("unable to ping any registry URLs")
 	ErrSyncImageNotSigned               = errors.New("synced image is not signed")
 	ErrSyncImageFilteredOut             = errors.New("image is filtered out by sync config")
+	ErrSyncDockerCompatRequired         = errors.New("docker media type requires http.compat docker2s2")
 	ErrSyncParseRemoteRepo              = errors.New("failed to parse remote repo")
 	ErrInvalidTruststoreType            = errors.New("invalid signature truststore type")
 	ErrInvalidTruststoreName            = errors.New("invalid signature truststore name")
@@ -186,6 +186,8 @@ var (
 	ErrInvalidBearerToken               = errors.New("invalid bearer token given")
 	ErrInvalidUpstreamTokenEndpoint     = errors.New("invalid upstream token endpoint realm")
 	ErrInvalidTokenProxyForm            = errors.New("invalid token proxy form body")
+	ErrTokenRequestBodyTooLarge         = errors.New("token request body too large")
+	ErrInvalidWrappedBearerCredential   = errors.New("invalid wrapped bearer credential")
 	ErrInvalidOrUnreachableOIDCIssuer   = errors.New("invalid or unreachable oidc issuer")
 	ErrInsufficientScope                = errors.New("bearer token does not have sufficient scope")
 	ErrCouldNotLoadPublicKey            = errors.New("failed to load public key")

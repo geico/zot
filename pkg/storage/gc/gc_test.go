@@ -14,7 +14,6 @@ import (
 	_ "github.com/distribution/distribution/v3/registry/storage/driver/s3-aws"
 	guuid "github.com/gofrs/uuid"
 	godigest "github.com/opencontainers/go-digest"
-	"github.com/opencontainers/image-spec/specs-go"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	. "github.com/smartystreets/goconvey/convey"
 	"gopkg.in/resty.v1"
@@ -65,6 +64,50 @@ var testCases = []struct {
 		testCaseName: azureTestName,
 		storageType:  storageConstants.AzureStorageDriverName,
 	},
+}
+
+// resetGCTestRepos wipes layout (and optional MetaDB rows) so GoConvey can re-run
+// "setup gc images" without accumulating untagged index rows from last-tag overwrite
+// retention across nested leaves.
+func resetGCTestRepos(imgStore storageTypes.ImageStore, metaDB mTypes.MetaDB, repos ...string) {
+	emptyIndex := ispec.Index{
+		SchemaVersion: 2,
+		MediaType:     ispec.MediaTypeImageIndex,
+	}
+
+	for _, repo := range repos {
+		repoDir := path.Join(imgStore.RootDir(), repo)
+		if !imgStore.DirExists(repoDir) {
+			if metaDB != nil {
+				_ = metaDB.DeleteRepoMeta(repo)
+			}
+
+			continue
+		}
+
+		blobs, err := imgStore.GetAllBlobs(repo)
+		if err != nil {
+			blobs = nil
+		}
+
+		var lockLatency time.Time
+
+		imgStore.Lock(&lockLatency)
+
+		_ = imgStore.PutIndexContent(repo, emptyIndex)
+
+		if len(blobs) > 0 {
+			_, _ = imgStore.CleanupRepo(repo, blobs)
+		}
+
+		_, _ = imgStore.RemoveIdleRepository(repo, 0)
+
+		imgStore.Unlock(&lockLatency)
+
+		if metaDB != nil {
+			_ = metaDB.DeleteRepoMeta(repo)
+		}
+	}
 }
 
 // The backend subtests run in parallel, but the top-level test stays sequential on
@@ -233,6 +276,12 @@ func TestGarbageCollectAndRetentionMetaDB(t *testing.T) {
 			ctx := context.Background()
 
 			Convey("setup gc images", t, func() {
+				// Fresh repos each GoConvey leaf: parent setup re-runs on a shared store,
+				// and last-tag overwrite retains prior digests in index.json.
+				resetGCTestRepos(imgStore, metaDB,
+					"gc-test1", "gc-test2", "gc-test3", "gc-test4",
+					"gc-docker1", "gc-docker2", "retention")
+
 				// for gc testing
 				// basic images
 				gcTest1 := CreateRandomImage()
@@ -1428,8 +1477,8 @@ func TestGarbageCollectDeletion(t *testing.T) {
 			So(err, ShouldBeNil)
 
 			topIndex := ispec.Index{
-				Versioned: specs.Versioned{SchemaVersion: 2},
-				MediaType: ispec.MediaTypeImageIndex,
+				SchemaVersion: 2,
+				MediaType:     ispec.MediaTypeImageIndex,
 				Manifests: []ispec.Descriptor{
 					{
 						Digest:    bottomIndex1.IndexDescriptor.Digest,
@@ -1925,6 +1974,11 @@ func TestGarbageCollectAndRetentionNoMetaDB(t *testing.T) {
 			ctx := context.Background()
 
 			Convey("setup gc images", t, func() {
+				// Fresh repos each GoConvey leaf: parent setup re-runs on a shared store,
+				// and last-tag overwrite retains prior digests in index.json.
+				resetGCTestRepos(imgStore, metaDB,
+					"gc-test1", "gc-test2", "gc-test3", "gc-test4", "retention")
+
 				// for gc testing
 				// basic images
 				gcTest1 := CreateRandomImage()
@@ -2794,8 +2848,8 @@ func TestGCMultiArchIndexKeepsNestedConfigAndLayers(t *testing.T) {
 		writeNestedOnly(platform2)
 
 		topIndex := ispec.Index{
-			Versioned: specs.Versioned{SchemaVersion: 2},
-			MediaType: ispec.MediaTypeImageIndex,
+			SchemaVersion: 2,
+			MediaType:     ispec.MediaTypeImageIndex,
 			Manifests: []ispec.Descriptor{
 				{
 					Digest:    platform1.ManifestDescriptor.Digest,
@@ -3752,9 +3806,9 @@ func TestGCUnknownMediaTypeManifestPrunedSharedBlobKept(t *testing.T) {
 
 		// the unknown manifest reuses the healthy image's config digest - this blob must survive
 		unknownManifest := ispec.Manifest{
-			Versioned: specs.Versioned{SchemaVersion: 2},
-			MediaType: unsupportedMediaType,
-			Config:    healthy.Manifest.Config,
+			SchemaVersion: 2,
+			MediaType:     unsupportedMediaType,
+			Config:        healthy.Manifest.Config,
 			Layers: []ispec.Descriptor{{
 				MediaType: ispec.MediaTypeImageLayer,
 				Digest:    exclusiveLayerDigest,

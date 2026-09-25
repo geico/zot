@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aquasecurity/trivy-db/pkg/metadata"
 	dbTypes "github.com/aquasecurity/trivy-db/pkg/types"
@@ -30,8 +31,8 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	regTypes "github.com/google/go-containerregistry/pkg/v1/types"
 	godigest "github.com/opencontainers/go-digest"
-	"github.com/opencontainers/image-spec/specs-go"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sync/singleflight"
 	_ "modernc.org/sqlite"
 
 	zerr "zotregistry.dev/zot/v2/errors"
@@ -88,38 +89,26 @@ func getNewScanOptions(dir string, dbRepositoryRef, javaDBRepositoryRef name.Ref
 	vulnSeveritySources []dbTypes.SourceID, ignoreFile string, sbomEnabled bool, tuning trivyScanTuning,
 ) *flag.Options {
 	scanOptions := flag.Options{
-		GlobalOptions: flag.GlobalOptions{
-			CacheDir: dir,
-		},
-		ScanOptions: flag.ScanOptions{
-			Scanners:         types.Scanners{types.VulnerabilityScanner},
-			SkipVersionCheck: true,
-			DisableTelemetry: true,
-			OfflineScan:      true,
-		},
-		PackageOptions: flag.PackageOptions{
-			PkgRelationships: fanalTypes.Relationships,
-			PkgTypes:         []string{types.PkgTypeOS, types.PkgTypeLibrary},
-		},
-		DBOptions: flag.DBOptions{
-			DBRepositories:     []name.Reference{dbRepositoryRef},
-			JavaDBRepositories: []name.Reference{javaDBRepositoryRef},
-			SkipDBUpdate:       true,
-			SkipJavaDBUpdate:   true,
-		},
-		VulnerabilityOptions: flag.VulnerabilityOptions{
-			VulnSeveritySources: vulnSeveritySources,
-		},
-		ReportOptions: flag.ReportOptions{
-			Format:     "table",
-			IgnoreFile: ignoreFile,
-			Severities: []dbTypes.Severity{
-				dbTypes.SeverityUnknown,
-				dbTypes.SeverityLow,
-				dbTypes.SeverityMedium,
-				dbTypes.SeverityHigh,
-				dbTypes.SeverityCritical,
-			},
+		CacheDir:            dir,
+		Scanners:            types.Scanners{types.VulnerabilityScanner},
+		SkipVersionCheck:    true,
+		DisableTelemetry:    true,
+		OfflineScan:         true,
+		PkgRelationships:    fanalTypes.Relationships,
+		PkgTypes:            []string{types.PkgTypeOS, types.PkgTypeLibrary},
+		DBRepositories:      []name.Reference{dbRepositoryRef},
+		JavaDBRepositories:  []name.Reference{javaDBRepositoryRef},
+		SkipDBUpdate:        true,
+		SkipJavaDBUpdate:    true,
+		VulnSeveritySources: vulnSeveritySources,
+		Format:              "table",
+		IgnoreFile:          ignoreFile,
+		Severities: []dbTypes.Severity{
+			dbTypes.SeverityUnknown,
+			dbTypes.SeverityLow,
+			dbTypes.SeverityMedium,
+			dbTypes.SeverityHigh,
+			dbTypes.SeverityCritical,
 		},
 	}
 
@@ -178,6 +167,10 @@ type Scanner struct {
 	javaDBRepositoryRef name.Reference
 	vulnSeveritySources []dbTypes.SourceID
 	sbomOptions         sbomOptions
+
+	// SingleFlightGroup is used to prevent multiple requests
+	// running a trivy scan for the same digest repeatedly.
+	scanSingleFlightGroup *singleflight.Group
 }
 
 type sbomOptions struct {
@@ -279,16 +272,17 @@ func NewScanner(storeController storage.StoreController,
 	cveController.SubCveConfig = subCveConfig
 
 	return &Scanner{
-		log:                 log,
-		metaDB:              metaDB,
-		cveController:       cveController,
-		storeController:     storeController,
-		dbLock:              &sync.Mutex{},
-		cache:               cvecache.NewCveCache(cacheSize, log),
-		dbRepositoryRef:     dbRepositoryRef,
-		javaDBRepositoryRef: javaDBRepositoryRef,
-		vulnSeveritySources: sevSources,
-		sbomOptions:         sbomOpts,
+		log:                   log,
+		metaDB:                metaDB,
+		cveController:         cveController,
+		storeController:       storeController,
+		dbLock:                &sync.Mutex{},
+		cache:                 cvecache.NewCveCache(cacheSize, log),
+		dbRepositoryRef:       dbRepositoryRef,
+		javaDBRepositoryRef:   javaDBRepositoryRef,
+		vulnSeveritySources:   sevSources,
+		sbomOptions:           sbomOpts,
+		scanSingleFlightGroup: &singleflight.Group{},
 	}
 }
 
@@ -567,10 +561,6 @@ func (scanner Scanner) isManifestDataScannable(manifestData mTypes.ManifestMeta)
 }
 
 func (scanner Scanner) isIndexScannable(digestStr string) (bool, error) {
-	if scanner.cache.Get(digestStr) != nil {
-		return true, nil
-	}
-
 	indexData, err := scanner.metaDB.GetImageMeta(godigest.Digest(digestStr))
 	if err != nil {
 		return false, err
@@ -601,13 +591,131 @@ func (scanner Scanner) isIndexScannable(digestStr string) (bool, error) {
 	return false, nil
 }
 
-func (scanner Scanner) IsResultCached(digest string) bool {
+func (scanner Scanner) IsResultCached(repo, digest string) bool {
+	if scanner.isIndexDigest(digest) {
+		_, complete := scanner.cachedIndexAggregate(repo, digest)
+
+		return complete
+	}
+
 	// Check if the entry exists in cache without updating the recent-ness
 	return scanner.cache.Contains(digest)
 }
 
-func (scanner Scanner) GetCachedResult(digest string) map[string]zcommon.CVE {
+func (scanner Scanner) GetCachedResult(repo, digest string) map[string]zcommon.CVE {
+	if scanner.isIndexDigest(digest) {
+		cveMap, complete := scanner.cachedIndexAggregate(repo, digest)
+		if !complete {
+			return map[string]zcommon.CVE{}
+		}
+
+		return cveMap
+	}
+
 	return scanner.cache.Get(digest)
+}
+
+func (scanner Scanner) isIndexDigest(digest string) bool {
+	imageMeta, err := scanner.metaDB.GetImageMeta(godigest.Digest(digest))
+	if err != nil {
+		return false
+	}
+
+	return compat.IsImageIndexMediaType(imageMeta.MediaType)
+}
+
+// cachedIndexAggregate returns the union of cached CVE results for every present,
+// scannable index member. complete is false if any such member is uncached.
+// Missing blobs are skipped (same as scanIndex). The index digest is never a cache key.
+// Nested index children are aggregated recursively (never cached under the nested digest).
+func (scanner Scanner) cachedIndexAggregate(repo, digest string) (map[string]zcommon.CVE, bool) {
+	return scanner.cachedIndexAggregateSeen(repo, digest, map[string]struct{}{})
+}
+
+func (scanner Scanner) cachedIndexAggregateSeen(repo, digest string, seen map[string]struct{},
+) (map[string]zcommon.CVE, bool) {
+	if _, ok := seen[digest]; ok {
+		return map[string]zcommon.CVE{}, true
+	}
+
+	seen[digest] = struct{}{}
+
+	indexData, err := scanner.metaDB.GetImageMeta(godigest.Digest(digest))
+	if err != nil || indexData.Index == nil {
+		return nil, false
+	}
+
+	indexCveIDMap := map[string]zcommon.CVE{}
+	imgStore := scanner.storeController.GetImageStore(repo)
+
+	for _, manifest := range indexData.Index.Manifests {
+		if imgStore != nil {
+			var lockLatency time.Time
+
+			imgStore.RLock(&lockLatency)
+			_, _, _, err := imgStore.StatBlob(repo, manifest.Digest)
+			imgStore.RUnlock(&lockLatency)
+
+			if err != nil {
+				if errors.Is(err, zerr.ErrManifestNotFound) || errors.Is(err, zerr.ErrBlobNotFound) {
+					continue
+				}
+
+				return nil, false
+			}
+		}
+
+		digestStr := manifest.Digest.String()
+
+		if scanner.indexChildIsIndex(manifest) {
+			nestedMap, complete := scanner.cachedIndexAggregateSeen(repo, digestStr, seen)
+			if !complete {
+				return nil, false
+			}
+
+			maps.Copy(indexCveIDMap, nestedMap)
+
+			continue
+		}
+
+		isScannable, err := scanner.isManifestScannable(digestStr)
+		if err != nil {
+			// Definitively unscannable children need no cache entry; other lookup
+			// failures leave the aggregate incomplete so callers do not treat the
+			// index as scanned.
+			if errors.Is(err, zerr.ErrScanNotSupported) {
+				continue
+			}
+
+			return nil, false
+		}
+
+		if !isScannable {
+			continue
+		}
+
+		cachedMap := scanner.cache.Get(digestStr)
+		if cachedMap == nil {
+			return nil, false
+		}
+
+		maps.Copy(indexCveIDMap, cachedMap)
+	}
+
+	return indexCveIDMap, true
+}
+
+// indexChildIsIndex reports whether an index descriptor refers to a nested index.
+func (scanner Scanner) indexChildIsIndex(desc ispec.Descriptor) bool {
+	if compat.IsImageIndexMediaType(desc.MediaType) {
+		return true
+	}
+
+	if compat.IsImageManifestMediaType(desc.MediaType) {
+		return false
+	}
+
+	return scanner.isIndexDigest(desc.Digest.String())
 }
 
 func (scanner Scanner) ScanImage(ctx context.Context, image string) (cvemodel.ScanResult, error) {
@@ -645,6 +753,8 @@ func (scanner Scanner) ScanImage(ctx context.Context, image string) (cvemodel.Sc
 	)
 
 	if compat.IsImageIndexMediaType(mediaType) {
+		// Index aggregates are never stored under the index digest; WasCached is true when
+		// every present scannable member was already in the per-manifest cache.
 		cveIDMap, wasCached, err = scanner.scanIndex(ctx, repo, digest)
 	} else if compat.IsImageManifestMediaType(mediaType) {
 		cveIDMap, wasCached, err = scanner.scanManifest(ctx, repo, digest)
@@ -669,24 +779,63 @@ func (scanner Scanner) scanManifest(ctx context.Context, repo, digest string) (m
 		return cachedMap, true, nil
 	}
 
+	// prevent multiple requests running trivy multiple times; DoChan lets each caller
+	// stop waiting on its own ctx without canceling the shared scan for the other callers.
+	// The key includes repo since the same digest can be scanned concurrently through
+	// different repos, each resolving to its own store config and SBOM persistence target.
+	resultChan := scanner.scanSingleFlightGroup.DoChan(repo+"@"+digest, func() (any, error) {
+		return scanner.scanManifestUncached(ctx, repo, digest)
+	})
+
+	select {
+	case result := <-resultChan:
+		if result.Err != nil {
+			return map[string]zcommon.CVE{}, false, result.Err
+		}
+
+		// the singleflight function above always returns a cacheableScanResult, so this
+		// type assertion cannot fail; a compile-time check lives in scanManifestUncached's
+		// own return type.
+		scanResult, _ := result.Val.(cacheableScanResult)
+
+		return scanResult.cachedMap, scanResult.wasCached, nil
+	case <-ctx.Done():
+		return map[string]zcommon.CVE{}, false, ctx.Err()
+	}
+}
+
+// scanManifestUncached scans a single manifest digest, or returns the cached result if one
+// appeared while this call was queued behind the flight group. It is only ever invoked once
+// per digest at a time, via scanSingleFlightGroup, so it is safe to test in isolation.
+func (scanner Scanner) scanManifestUncached(ctx context.Context, repo, digest string) (cacheableScanResult, error) {
+	// Double check the cache under flight group lock to prevent a race
+	// where a caller just sees a cache miss before the cache is updated.
+	// In this case, the caller initiates a fresh flight even though a scan just finished up.
+	// This avoids a double scan of the image.
+	if cachedMap := scanner.cache.Get(digest); cachedMap != nil {
+		return cacheableScanResult{cachedMap, true}, nil
+	}
+
 	cveidMap := map[string]zcommon.CVE{}
 	image := repo + "@" + digest
 
+	// Use separate context without cancellation for scanning
+	scanCtx := context.WithoutCancel(ctx)
 	scanner.dbLock.Lock()
 	opts := scanner.getTrivyOptions(image)
-	report, sbom, err := scanner.runTrivy(ctx, opts)
+	report, sbom, err := scanner.runTrivy(scanCtx, opts)
 	scanner.dbLock.Unlock()
 	if sbom != nil && sbom.filePath != "" {
 		defer os.Remove(sbom.filePath)
 	}
 
-	if err != nil { //nolint: wsl
-		return cveidMap, false, err
+	if err != nil {
+		return cacheableScanResult{}, err
 	}
 
 	// SBOM persistence is best-effort: CVE scanning should still complete even if
 	// SBOM artifact upload fails.
-	if err = scanner.storeSBOMAsOCIArtifact(ctx, repo, digest, sbom); err != nil {
+	if err = scanner.storeSBOMAsOCIArtifact(scanCtx, repo, digest, sbom); err != nil {
 		scanner.log.Warn().Err(err).Str("image", image).Msg("failed to store generated sbom as OCI artifact")
 	}
 
@@ -760,7 +909,7 @@ func (scanner Scanner) scanManifest(ctx context.Context, repo, digest string) (m
 
 	scanner.cache.Add(digest, cveidMap)
 
-	return cveidMap, false, nil
+	return cacheableScanResult{cveidMap, false}, nil
 }
 
 func (scanner Scanner) storeSBOMAsOCIArtifact(ctx context.Context,
@@ -843,9 +992,9 @@ func (scanner Scanner) storeSBOMAsOCIArtifact(ctx context.Context,
 	}
 
 	sbomManifest := ispec.Manifest{
-		Versioned:    specs.Versioned{SchemaVersion: storageConstants.SchemaVersion},
-		MediaType:    ispec.MediaTypeImageManifest,
-		ArtifactType: scanner.sbomOptions.artifactType,
+		SchemaVersion: storageConstants.SchemaVersion,
+		MediaType:     ispec.MediaTypeImageManifest,
+		ArtifactType:  scanner.sbomOptions.artifactType,
 		Subject: &ispec.Descriptor{
 			MediaType: subjectMediaType,
 			Digest:    subject,
@@ -945,10 +1094,69 @@ func getNVDReference(references []string) (string, bool) {
 	return "", false
 }
 
+type cacheableScanResult struct {
+	cachedMap map[string]zcommon.CVE
+	wasCached bool
+}
+
 func (scanner Scanner) scanIndex(ctx context.Context, repo, digest string) (map[string]zcommon.CVE, bool, error) {
-	if cachedMap := scanner.cache.Get(digest); cachedMap != nil {
-		return cachedMap, true, nil
+	// prevent multiple requests running trivy multiple times for the same top-level index;
+	// DoChan lets each caller stop waiting on its own ctx without canceling the shared scan
+	// for the others. The key includes repo: the same index digest can differ in child
+	// presence across repos, so a scan for one repo must never be shared with another.
+	//
+	// Dedup applies only at this top level, never inside scanIndexSeen's recursion into
+	// nested indexes: a nested step's result depends on the ancestor `seen` set as well as
+	// (repo, digest), so sharing its flight across two independent traversals could hand one
+	// of them an incomplete aggregate (an ancestor wrongly treated as already visited), or,
+	// for cyclic index metadata, let two concurrent top-level scans each hold the flight the
+	// other's traversal is blocked waiting on and deadlock.
+	// The traversal itself runs with cancellation detached from this specific caller: an
+	// uncached child is scanned via scanManifest, which errors with ctx.Err() the moment its
+	// own wait is abandoned, and that error would otherwise surface as *this shared flight's*
+	// result for every waiter, not just the one whose ctx was canceled.
+	resultChan := scanner.scanSingleFlightGroup.DoChan(repo+"@"+digest, func() (any, error) {
+		cveIDMap, wasCached, err := scanner.scanIndexSeen(context.WithoutCancel(ctx), repo, digest, map[string]struct{}{})
+		if err != nil {
+			return cacheableScanResult{}, err
+		}
+
+		return cacheableScanResult{cveIDMap, wasCached}, nil
+	})
+
+	select {
+	case result := <-resultChan:
+		if result.Err != nil {
+			return map[string]zcommon.CVE{}, false, result.Err
+		}
+
+		// the singleflight function above always returns a cacheableScanResult, so this
+		// type assertion cannot fail.
+		scanResult, _ := result.Val.(cacheableScanResult)
+
+		return scanResult.cachedMap, scanResult.wasCached, nil
+	case <-ctx.Done():
+		return map[string]zcommon.CVE{}, false, ctx.Err()
 	}
+}
+
+// scanIndexSeen aggregates CVEs for an index's children by iterating its manifests, recursing
+// into itself for nested indexes (by plain call, not through scanSingleFlightGroup: see
+// scanIndex) since a nested traversal step's result depends on the ancestor `seen` set, not
+// just (repo, digest), and delegating to scanManifest (itself deduped and cache-checked) for
+// leaves.
+func (scanner Scanner) scanIndexSeen(ctx context.Context, repo, digest string, seen map[string]struct{},
+) (map[string]zcommon.CVE, bool, error) {
+	// Do not cache index aggregates under the index digest: the same digest can be
+	// fully present in one repo and sparse in another (or change after GC / on-demand
+	// sync). Always Stat children in this repo and aggregate; per-manifest CVE results
+	// (and Trivy's own cache) still avoid re-scanning children. Nested indexes recurse
+	// here instead of scanManifest so their digests are never used as cache keys.
+	if _, ok := seen[digest]; ok {
+		return map[string]zcommon.CVE{}, true, nil
+	}
+
+	seen[digest] = struct{}{}
 
 	indexData, err := scanner.metaDB.GetImageMeta(godigest.Digest(digest))
 	if err != nil {
@@ -960,23 +1168,74 @@ func (scanner Scanner) scanIndex(ctx context.Context, repo, digest string) (map[
 	}
 
 	indexCveIDMap := map[string]zcommon.CVE{}
+	wasCached := true
+
+	imgStore := scanner.storeController.GetImageStore(repo)
 
 	for _, manifest := range indexData.Index.Manifests {
-		if isScannable, err := scanner.isManifestScannable(manifest.Digest.String()); isScannable && err == nil {
-			// the per-manifest cache status doesn't matter here: it's the aggregate index-level
-			// cache check above that determines whether this ScanImage call is a cache hit
-			manifestCveIDMap, _, err := scanner.scanManifest(ctx, repo, manifest.Digest.String())
+		if imgStore != nil {
+			var lockLatency time.Time
+
+			imgStore.RLock(&lockLatency)
+			_, _, _, err := imgStore.StatBlob(repo, manifest.Digest)
+			imgStore.RUnlock(&lockLatency)
+
 			if err != nil {
-				return nil, false, err
+				if errors.Is(err, zerr.ErrManifestNotFound) || errors.Is(err, zerr.ErrBlobNotFound) {
+					scanner.log.Warn().Err(err).Str("repo", repo).Str("index", digest).
+						Str("manifest", manifest.Digest.String()).
+						Msg("skipping missing child while scanning image index")
+
+					continue
+				}
+
+				return map[string]zcommon.CVE{}, false, err
+			}
+		}
+
+		digestStr := manifest.Digest.String()
+
+		if scanner.indexChildIsIndex(manifest) {
+			nestedCveIDMap, childCached, err := scanner.scanIndexSeen(ctx, repo, digestStr, seen)
+			if err != nil {
+				return map[string]zcommon.CVE{}, false, err
 			}
 
-			maps.Copy(indexCveIDMap, manifestCveIDMap)
+			if !childCached {
+				wasCached = false
+			}
+
+			maps.Copy(indexCveIDMap, nestedCveIDMap)
+
+			continue
 		}
+
+		isScannable, err := scanner.isManifestScannable(digestStr)
+		if err != nil {
+			if errors.Is(err, zerr.ErrScanNotSupported) {
+				continue
+			}
+
+			return map[string]zcommon.CVE{}, false, err
+		}
+
+		if !isScannable {
+			continue
+		}
+
+		manifestCveIDMap, childCached, err := scanner.scanManifest(ctx, repo, digestStr)
+		if err != nil {
+			return map[string]zcommon.CVE{}, false, err
+		}
+
+		if !childCached {
+			wasCached = false
+		}
+
+		maps.Copy(indexCveIDMap, manifestCveIDMap)
 	}
 
-	scanner.cache.Add(digest, indexCveIDMap)
-
-	return indexCveIDMap, false, nil
+	return indexCveIDMap, wasCached, nil
 }
 
 // UpdateDB downloads the Trivy DB / Cache under the store root directory.

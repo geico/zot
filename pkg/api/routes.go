@@ -284,20 +284,21 @@ func (rh *RouteHandler) CheckVersionSupport(response http.ResponseWriter, reques
 	}
 
 	response.Header().Set(constants.DistAPIVersion, "registry/2.0")
-	// NOTE: compatibility workaround - return this header in "allowed-read" mode to allow for clients to
-	// work correctly
-	// Get auth config safely
+
+	// Docker clients that receive 200 on /v2/ may skip credentials later. Advertise
+	// auth when anonymous access coexists with protected repos, but not when every
+	// configured policy is anonymous-only.
 	authConfig := rh.c.Config.CopyAuthConfig()
-	if authConfig.IsBasicAuthnEnabled() || authConfig.IsBearerAuthEnabled() {
-		// don't send auth headers if request is coming from UI
-		if request.Header.Get(constants.SessionClientHeaderName) != constants.SessionClientHeaderValue {
-			if authConfig.Bearer != nil {
-				realm := authConfig.Bearer.Realm
-				response.Header().Set("WWW-Authenticate", "bearer realm="+realm)
-			} else {
-				realm := rh.c.Config.GetRealm()
-				response.Header().Set("WWW-Authenticate", "basic realm="+realm)
-			}
+	accessControlConfig := rh.c.Config.CopyAccessControlConfig()
+	allowAnonymous := accessControlConfig != nil && accessControlConfig.AnonymousPolicyExists()
+	needsAuthChallenge := !allowAnonymous || accessControlConfig.HasMixedAnonymousAndAuthenticatedPolicies()
+
+	// don't send auth headers if request is coming from UI
+	if !hasSessionHeader(request) && needsAuthChallenge {
+		if authConfig.ShouldAdvertiseBearerChallenge() {
+			setBearerAuthChallenge(response, authConfig, nil)
+		} else if authConfig.CanAuthenticateWithBasicCredentials() {
+			setBasicAuthChallenge(response, rh.c.Config.GetRealm())
 		}
 	}
 
@@ -393,21 +394,9 @@ func (rh *RouteHandler) ListTags(response http.ResponseWriter, request *http.Req
 	startIndex := 0
 
 	if last != "" {
-		found := false
-
-		for i, tag := range tags {
-			if tag == last {
-				found = true
-				startIndex = i + 1
-
-				break
-			}
-		}
-
-		if !found {
-			response.WriteHeader(http.StatusNotFound)
-
-			return
+		startIndex = sort.SearchStrings(tags, last)
+		if startIndex < len(tags) && tags[startIndex] == last {
+			startIndex++
 		}
 	}
 
@@ -781,8 +770,7 @@ func (rh *RouteHandler) UpdateManifest(response http.ResponseWriter, request *ht
 	// hard to reach test case, injected error (simulates an interrupted image manifest upload)
 	// err could be io.ErrUnexpectedEOF or *http.MaxBytesError
 	if err := inject.Error(err); err != nil {
-		var mbe *http.MaxBytesError
-		if errors.As(err, &mbe) {
+		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 			e := apiErr.NewError(apiErr.MANIFEST_INVALID).AddDetail(map[string]string{
 				"reason": fmt.Sprintf("manifest body exceeds maximum allowed size of %d bytes", constants.MaxManifestBodySize),
 			})
@@ -952,7 +940,7 @@ func (rh *RouteHandler) DeleteManifest(response http.ResponseWriter, request *ht
 		if errors.Is(err, zerr.ErrRepoNotFound) { //nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
 			details["name"] = name
 			e := apiErr.NewError(apiErr.NAME_UNKNOWN).AddDetail(details)
-			zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
+			zcommon.WriteJSON(response, http.StatusNotFound, apiErr.NewErrorList(e))
 		} else if errors.Is(err, zerr.ErrManifestNotFound) {
 			details["reference"] = reference
 			e := apiErr.NewError(apiErr.MANIFEST_UNKNOWN).AddDetail(details)
@@ -977,7 +965,7 @@ func (rh *RouteHandler) DeleteManifest(response http.ResponseWriter, request *ht
 		if errors.Is(err, zerr.ErrRepoNotFound) { //nolint:gocritic // errorslint conflicts with gocritic:IfElseChain
 			details["name"] = name
 			e := apiErr.NewError(apiErr.NAME_UNKNOWN).AddDetail(details)
-			zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(e))
+			zcommon.WriteJSON(response, http.StatusNotFound, apiErr.NewErrorList(e))
 		} else if errors.Is(err, zerr.ErrManifestNotFound) {
 			details["reference"] = reference
 			e := apiErr.NewError(apiErr.MANIFEST_UNKNOWN).AddDetail(details)
@@ -2851,8 +2839,7 @@ func (rh *RouteHandler) CreateAPIKey(resp http.ResponseWriter, req *http.Request
 
 	body, err := io.ReadAll(http.MaxBytesReader(resp, req.Body, constants.MaxAPIKeyBodySize))
 	if err != nil {
-		var mbe *http.MaxBytesError
-		if errors.As(err, &mbe) {
+		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 			resp.WriteHeader(http.StatusRequestEntityTooLarge)
 		} else {
 			rh.c.Log.Error().Msg("failed to read request body")

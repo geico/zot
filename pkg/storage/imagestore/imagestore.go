@@ -199,8 +199,7 @@ func (is *ImageStore) initRepo(ctx context.Context, name string) error {
 	// "index.json" file - create if it doesn't exist
 	indexPath := path.Join(repoDir, ispec.ImageIndexFile)
 	if _, err := is.storeDriver.Stat(indexPath); err != nil {
-		index := ispec.Index{}
-		index.SchemaVersion = 2
+		index := ispec.Index{SchemaVersion: 2}
 
 		buf, err := json.Marshal(index)
 		if err != nil {
@@ -302,6 +301,12 @@ func (is *ImageStore) GetNextRepositories(lastRepo string, maxEntries int, filte
 	moreEntries := false
 	entries := 0
 	found := false
+
+	lastExists := false
+	if lastRepo != "" && is.DirExists(path.Join(is.rootDir, lastRepo)) {
+		lastExists, _ = is.ValidateRepo(lastRepo)
+	}
+
 	err := is.storeDriver.Walk(dir, func(fileInfo driver.FileInfo) error {
 		if entries == maxEntries {
 			moreEntries = true
@@ -346,16 +351,15 @@ func (is *ImageStore) GetNextRepositories(lastRepo string, maxEntries int, filte
 			return nil
 		}
 
-		if lastRepo == "" {
-			found = true
-		}
+		// A missing last is placed by name, since the walk is not in lexical order.
+		afterLast := found || lastRepo == "" || (!lastExists && rel > lastRepo)
 
 		ok, err = filterFn(rel)
 		if err != nil {
 			return err
 		}
 
-		if found && ok {
+		if afterLast && ok {
 			entries++
 
 			stores = append(stores, rel)
@@ -431,8 +435,7 @@ func (is *ImageStore) GetRepositories() ([]string, error) {
 	})
 
 	// if the root directory is not yet created then return an empty slice of repositories
-	var perr driver.PathNotFoundError
-	if errors.As(err, &perr) {
+	if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
 		return stores, nil
 	}
 
@@ -692,11 +695,44 @@ func (is *ImageStore) PutImageManifest(ctx context.Context, repo, reference, med
 	dir := path.Join(is.rootDir, repo, ispec.ImageBlobsDir, mDigest.Algorithm().String())
 	manifestPath := path.Join(dir, mDigest.Encoded())
 
-	binfo, err := is.storeDriver.Stat(manifestPath)
-	if err != nil || binfo.Size() != desc.Size {
-		// The blob isn't already there, or it is corrupted, and needs a correction
-		if _, err = is.storeDriver.WriteFile(manifestPath, body); err != nil {
+	binfo, statErr := is.storeDriver.Stat(manifestPath)
+	needsWrite := statErr != nil
+	if !needsWrite {
+		needsWrite = binfo.Size() != desc.Size
+	}
+
+	if !needsWrite {
+		// body is already digest-validated; compare to on-disk bytes instead of
+		// re-hashing (manifests are small / API-capped at MaxManifestBodySize).
+		// Hashing would add compute overhead.
+		stored, readErr := is.storeDriver.ReadFile(manifestPath)
+		if readErr != nil || !slices.Equal(stored, body) {
+			if readErr != nil {
+				is.log.Warn().Err(readErr).Str("file", manifestPath).
+					Msg("failed to read existing manifest; rewriting")
+			} else {
+				is.log.Warn().Str("file", manifestPath).
+					Msg("manifest blob content mismatch; rewriting")
+			}
+
+			needsWrite = true
+		}
+	}
+
+	if needsWrite {
+		// Prefer in-place write for digest blobs so hard-linked dedupe siblings
+		// share the repaired inode (local Driver.WriteFile truncates in place).
+		nbytes, writeErr := is.storeDriver.WriteFile(manifestPath, body)
+		if writeErr != nil {
+			err = writeErr
 			is.log.Error().Err(err).Str("file", manifestPath).Msg("failed to write")
+
+			return "", "", err
+		}
+
+		if nbytes != len(body) {
+			err = io.ErrShortWrite
+			is.log.Error().Err(err).Str("file", manifestPath).Msg("failed to write manifest: short write")
 
 			return "", "", err
 		}
@@ -739,7 +775,7 @@ func (is *ImageStore) PutImageManifest(ctx context.Context, repo, reference, med
 				},
 			}
 
-			updateIndex, oldDgst, err = common.CheckIfIndexNeedsUpdate(&index, &descLocal, is.log)
+			updateIndex, oldDgst, err = common.UpdateIndexOnTagOverwrite(&index, &descLocal, is.log)
 			if err != nil {
 				return "", "", err
 			}
@@ -772,7 +808,7 @@ func (is *ImageStore) PutImageManifest(ctx context.Context, repo, reference, med
 			},
 		}
 	} else {
-		updateIndex, oldDgst, err := common.CheckIfIndexNeedsUpdate(&index, &desc, is.log)
+		updateIndex, oldDgst, err := common.UpdateIndexOnTagOverwrite(&index, &desc, is.log)
 		if err != nil {
 			return "", "", err
 		}
@@ -1556,6 +1592,13 @@ func (is *ImageStore) CheckBlob(ctx context.Context, repo string, digest godiges
 			return false, -1, zerr.ErrBlobNotFound
 		}
 
+		if blobSize == 0 && !isEmptyContentDigest(digest) {
+			is.log.Debug().Str("digest", digest.String()).Str("dstRecord", dstRecord).
+				Msg("dedupe origin is empty for non-empty digest")
+
+			return false, -1, zerr.ErrBlobNotFound
+		}
+
 		// put deduped blob in cache
 		if err := is.cache.PutBlob(digest, blobPath); err != nil {
 			is.log.Error().Err(err).Str("blobPath", blobPath).Str("component", "dedupe").Msg("failed to insert blob record")
@@ -1586,8 +1629,7 @@ func (is *ImageStore) CheckBlob(ctx context.Context, repo string, digest godiges
 	// Size == 0: either a genuine empty blob, or an S3-style deduped placeholder.
 	// Distinguish by comparing the digest against the hash of empty content for
 	// the same algorithm (cheap single-pass hash over 0 bytes).
-	emptyDigest := digest.Algorithm().FromBytes(nil)
-	if emptyDigest == digest {
+	if isEmptyContentDigest(digest) {
 		// Genuine empty blob (e.g. sha256:e3b0c44... or sha512:cf83e13...).
 		is.log.Debug().Str("blob path", blobPath).Msg("empty blob found")
 
@@ -1609,6 +1651,16 @@ func (is *ImageStore) CheckBlob(ctx context.Context, repo string, digest godiges
 
 	blobSize, err := is.copyBlob(ctx, repo, blobPath, dstRecord)
 	if err != nil {
+		return false, -1, zerr.ErrBlobNotFound
+	}
+
+	// Fail closed whether or not dedupe is enabled: never treat a zero-size
+	// cache origin as readable content for a non-empty digest (would be HTTP 200
+	// with a body that does not hash to the requested digest).
+	if blobSize == 0 {
+		is.log.Debug().Str("digest", digest.String()).Str("dstRecord", dstRecord).
+			Msg("dedupe origin is empty for non-empty digest")
+
 		return false, -1, zerr.ErrBlobNotFound
 	}
 
@@ -1753,9 +1805,7 @@ func (is *ImageStore) originalBlobInfo(repo string, digest godigest.Digest) (dri
 
 	binfo, err := is.storeDriver.Stat(blobPath)
 	if err != nil {
-		var pathNotFoundErr driver.PathNotFoundError
-
-		if errors.As(err, &pathNotFoundErr) {
+		if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
 			is.log.Debug().Err(err).Str("blob", blobPath).Str("digest", digest.String()).Msg("blob not found")
 		} else {
 			is.log.Error().Err(err).Str("blob", blobPath).Msg("failed to stat blob")
@@ -1769,8 +1819,7 @@ func (is *ImageStore) originalBlobInfo(repo string, digest godigest.Digest) (dri
 		// deduplication placeholder pointing into the cache.  Distinguish the
 		// two by checking whether the digest matches the hash of zero bytes for
 		// the same algorithm (cheap single-pass hash over 0 bytes).
-		emptyDigest := digest.Algorithm().FromBytes(nil)
-		if emptyDigest == digest {
+		if isEmptyContentDigest(digest) {
 			// Genuine empty blob – return its FileInfo as-is.
 			return binfo, nil
 		}
@@ -1788,9 +1837,25 @@ func (is *ImageStore) originalBlobInfo(repo string, digest godigest.Digest) (dri
 
 			return nil, zerr.ErrBlobNotFound
 		}
+
+		// Fail closed whether or not dedupe is enabled: a cache "origin" that is
+		// itself empty cannot be served for a non-empty digest (HTTP 200 with a
+		// body that does not match the digest). Prefer ErrBlobNotFound so clients
+		// can fall back instead of consuming a bogus empty body.
+		if binfo.Size() == 0 {
+			is.log.Debug().Str("digest", digest.String()).Str("blob", dstRecord).
+				Msg("dedupe origin is empty for non-empty digest")
+
+			return nil, zerr.ErrBlobNotFound
+		}
 	}
 
 	return binfo, nil
+}
+
+// isEmptyContentDigest reports whether digest is the algorithm's hash of zero bytes.
+func isEmptyContentDigest(digest godigest.Digest) bool {
+	return digest.Algorithm().FromBytes(nil) == digest
 }
 
 // GetBlob returns a stream to read the blob.
@@ -1959,34 +2024,60 @@ func (is *ImageStore) PutIndexContent(repo string, index ispec.Index) error {
 		return err
 	}
 
-	// Write to a unique file under .uploads (same layout as blob uploads), then rename into place.
-	// Stale files are picked up by the same blob-upload GC path as ordinary uploads.
-	// This avoids truncating/removing index.json on failure (e.g. ENOSPC) — see local Driver.WriteFile + Cancel.
+	// Write to a unique file under .uploads, then move it into place. Stale files
+	// are picked up by the same blob-upload GC path as ordinary uploads.
+	if err := is.writeFileViaStaging(repo, indexPath, buf); err != nil {
+		is.log.Error().Err(err).Str("file", indexPath).Msg("failed to replace index.json")
+
+		return err
+	}
+
+	return nil
+}
+
+// writeFileViaStaging writes content to a unique upload path before moving it
+// into place. This prevents a failed replacement from truncating the existing
+// destination and cleans up the temporary object on every failure path.
+func (is *ImageStore) writeFileViaStaging(repo, destination string, content []byte) error {
 	stagingUUID, err := guuid.NewV4()
 	if err != nil {
-		is.log.Error().Err(err).Str("repository", repo).Msg("failed to generate staging UUID")
-
 		return err
 	}
 
-	stagingID := stagingUUID.String()
-	tmpPath := is.BlobUploadPath(repo, stagingID)
+	stagingPath := is.BlobUploadPath(repo, stagingUUID.String())
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = is.storeDriver.Delete(stagingPath)
+		}
+	}()
 
-	if _, err = is.storeDriver.WriteFile(tmpPath, buf); err != nil {
-		is.log.Error().Err(err).Str("file", tmpPath).Msg("failed to write staging index")
-
-		_ = is.storeDriver.Delete(tmpPath)
-
+	nbytes, err := is.storeDriver.WriteFile(stagingPath, content)
+	if err != nil {
 		return err
 	}
 
-	if err := is.storeDriver.Move(tmpPath, indexPath); err != nil {
-		is.log.Error().Err(err).Str("from", tmpPath).Str("to", indexPath).Msg("failed to replace index.json")
-
-		_ = is.storeDriver.Delete(tmpPath)
-
-		return err
+	if nbytes != len(content) {
+		return io.ErrShortWrite
 	}
+
+	moveErr := is.storeDriver.Move(stagingPath, destination)
+	if moveErr != nil {
+		// Object-store drivers may implement Move as copy-then-delete. If the
+		// copy succeeded but deleting the staging object failed, the destination
+		// already contains the requested content and the write is complete.
+		storedContent, readErr := is.storeDriver.ReadFile(destination)
+		if readErr == nil && slices.Equal(storedContent, content) {
+			is.log.Warn().Err(moveErr).Str("file", destination).
+				Msg("staged write committed despite move error")
+
+			return nil
+		}
+
+		return moveErr
+	}
+
+	cleanup = false
 
 	return nil
 }
@@ -2152,8 +2243,7 @@ func (is *ImageStore) deleteBlobChecked(repo string, digest godigest.Digest, isR
 
 	binfo, err := is.storeDriver.Stat(blobPath)
 	if err != nil {
-		var pathNotFoundErr driver.PathNotFoundError
-		if errors.As(err, &pathNotFoundErr) {
+		if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
 			return zerr.ErrBlobNotFound
 		}
 
@@ -2248,8 +2338,7 @@ func (is *ImageStore) deleteBlobChecked(repo string, digest godigest.Digest, isR
 	}
 
 	if err := is.storeDriver.Delete(blobPath); err != nil {
-		var pathNotFoundErr driver.PathNotFoundError
-		if errors.As(err, &pathNotFoundErr) {
+		if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
 			is.log.Warn().Str("repository", repo).Str("digest", digest.String()).
 				Str("blobPath", blobPath).Msg("blob already removed from storage, skipping")
 
@@ -2417,9 +2506,7 @@ func (is *ImageStore) GetNextDigestWithBlobPaths(repos []string, lastDigests []g
 	})
 
 	// if the root directory is not yet created
-	var perr driver.PathNotFoundError
-
-	if errors.As(err, &perr) {
+	if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
 		return digest, duplicateBlobs, nil
 	}
 
@@ -2432,8 +2519,7 @@ func (is *ImageStore) getOriginalBlobFromDisk(duplicateBlobs []string) (string, 
 		if err != nil {
 			// The paths come from a listing taken earlier in the run, so a blob may have
 			// been deleted since. Keep looking: another copy may still hold the content.
-			var pathNotFound driver.PathNotFoundError
-			if errors.As(err, &pathNotFound) {
+			if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
 				is.log.Debug().Str("path", blobPath).Str("component", "storage").
 					Msg("blob deleted since it was listed, skipping")
 
@@ -2505,8 +2591,7 @@ func (is *ImageStore) dedupeBlobs(ctx context.Context, digest godigest.Digest, d
 			blob may have been deleted since. Skipping keeps the run progressing: failing the
 			task instead leaves its completion callback unrun, so OnRunComplete never fires
 			and the restore marker or the deferred-delete gate stays stuck. */
-			var pathNotFound driver.PathNotFoundError
-			if errors.As(err, &pathNotFound) {
+			if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
 				is.log.Debug().Str("path", blobPath).Str("component", "dedupe").
 					Msg("blob deleted since it was listed, skipping")
 
@@ -2578,8 +2663,7 @@ func (is *ImageStore) dedupeBlobs(ctx context.Context, digest godigest.Digest, d
 func (is *ImageStore) anyBlobExists(blobPaths []string) bool {
 	for _, blobPath := range blobPaths {
 		if _, err := is.storeDriver.Stat(blobPath); err != nil {
-			var pathNotFound driver.PathNotFoundError
-			if errors.As(err, &pathNotFound) {
+			if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
 				continue
 			}
 		}
@@ -2625,8 +2709,7 @@ func (is *ImageStore) restoreDedupedBlobs(ctx context.Context, digest godigest.D
 			blob may have been deleted since. Skipping keeps the run progressing: failing the
 			task instead leaves its completion callback unrun, so OnRunComplete never fires
 			and the restore marker or the deferred-delete gate stays stuck. */
-			var pathNotFound driver.PathNotFoundError
-			if errors.As(err, &pathNotFound) {
+			if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
 				is.log.Debug().Str("path", blobPath).Str("component", "dedupe").
 					Msg("blob deleted since it was listed, skipping")
 
@@ -2670,8 +2753,7 @@ func (is *ImageStore) restoreDedupedBlobs(ctx context.Context, digest godigest.D
 						return nil
 					}
 				} else {
-					var pathNotFound driver.PathNotFoundError
-					if !errors.As(serr, &pathNotFound) {
+					if _, ok := errors.AsType[driver.PathNotFoundError](serr); !ok {
 						return serr
 					}
 				}
@@ -2720,8 +2802,7 @@ func (is *ImageStore) RunDedupeBlobs(interval time.Duration, sch *scheduler.Sche
 		// Dedupe is active: remove the restore-complete marker so that a future dedupe→false
 		// transition knows it must run restore again.
 		if err := is.storeDriver.Delete(markerPath); err != nil {
-			var pathNotFound driver.PathNotFoundError
-			if !errors.As(err, &pathNotFound) {
+			if _, ok := errors.AsType[driver.PathNotFoundError](err); !ok {
 				is.log.Warn().Err(err).Str("component", "dedupe").
 					Msg("failed to remove restore-complete marker")
 
@@ -2753,8 +2834,7 @@ func (is *ImageStore) RunDedupeBlobs(interval time.Duration, sch *scheduler.Sche
 			is.log.Debug().Str("component", "dedupe").Str("content", content).
 				Msg("restore-complete marker present but not complete, continuing with dedupe restore scan")
 		} else {
-			var pathNotFound driver.PathNotFoundError
-			if !errors.As(err, &pathNotFound) {
+			if _, ok := errors.AsType[driver.PathNotFoundError](err); !ok {
 				is.log.Warn().Err(err).Str("component", "dedupe").
 					Msg("failed to check restore-complete marker; continuing with dedupe restore scan")
 			}

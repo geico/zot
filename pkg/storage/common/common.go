@@ -19,7 +19,6 @@ import (
 	"github.com/distribution/distribution/v3/registry/storage/driver"
 	godigest "github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/schema"
-	imeta "github.com/opencontainers/image-spec/specs-go"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	jsonschemaV5 "github.com/santhosh-tekuri/jsonschema/v5"
 
@@ -140,23 +139,14 @@ func ValidateManifest(imgStore storageTypes.ImageStore, repo, reference, mediaTy
 			return zerr.NewError(zerr.ErrBadManifest).AddDetail("jsonSchemaValidation", err.Error())
 		}
 
-		var indexManifest ispec.Index
-		if err := json.Unmarshal(body, &indexManifest); err != nil {
+		// Sparse indexes are allowed: listed child manifests need not exist yet.
+		// Config/layer presence is enforced when those children are pushed as images.
+		if err := json.Unmarshal(body, new(ispec.Index)); err != nil {
 			log.Error().Err(err).Msg("failed to unmarshal JSON")
 
 			return zerr.ErrBadManifest
 		}
-
-		for _, manifest := range indexManifest.Manifests {
-			if ok, _, _, err := imgStore.StatBlob(repo, manifest.Digest); !ok || err != nil {
-				log.Error().Err(err).Str("digest", manifest.Digest.String()).
-					Msg("failed to stat manifest due to missing manifest blob")
-
-				return zerr.ErrBadManifest
-			}
-		}
-	default:
-		// non-OCI compatible
+	case docker.MediaTypeManifest:
 		descriptors, err := compat.Validate(body, mediaType)
 		if err != nil {
 			log.Error().Err(err).Msg("failed to unmarshal JSON")
@@ -165,13 +155,30 @@ func ValidateManifest(imgStore storageTypes.ImageStore, repo, reference, mediaTy
 		}
 
 		for _, desc := range descriptors {
-			if ok, _, _, err := imgStore.StatBlob(repo, desc.Digest); !ok || err != nil {
+			if IsNonDistributable(desc.MediaType) {
+				log.Debug().Str("digest", desc.Digest.String()).Str("mediaType", desc.MediaType).
+					Msg("skip checking non-distributable blob exists")
+
+				continue
+			}
+
+			ok, _, _, err := imgStore.StatBlob(repo, desc.Digest)
+			if !ok || err != nil {
 				log.Error().Err(err).Str("digest", desc.Digest.String()).
 					Msg("failed to stat non-OCI descriptor due to missing blob")
 
 				return zerr.ErrBadManifest
 			}
 		}
+	case dockerList.MediaTypeManifestList:
+		// Sparse lists may omit children (same policy as OCI indexes).
+		if _, err := compat.Validate(body, mediaType); err != nil {
+			log.Error().Err(err).Msg("failed to unmarshal JSON")
+
+			return zerr.ErrBadManifest
+		}
+	default:
+		// Media type already accepted by IsSupportedMediaType; no further checks.
 	}
 
 	return nil
@@ -202,11 +209,16 @@ func GetAndValidateRequestDigest(body []byte, reference string, log zlog.Logger)
 }
 
 /*
-CheckIfIndexNeedsUpdate verifies if an index needs to be updated given a new manifest descriptor.
+UpdateIndexOnTagOverwrite decides whether putting desc requires an index.json change.
 
-Returns whether or not index needs update, in the latter case it will also return the previous digest.
+If desc carries a tag that already points at a different digest, the prior tag is
+removed via RemoveManifestDescByReference (same last-tag → untagged retention as
+delete-by-tag). The caller is responsible for appending desc afterward.
+
+Returns whether the index must be written, and the previous digest when a tag was
+retargeted (used for multi-arch prune).
 */
-func CheckIfIndexNeedsUpdate(index *ispec.Index, desc *ispec.Descriptor,
+func UpdateIndexOnTagOverwrite(index *ispec.Index, desc *ispec.Descriptor,
 	log zlog.Logger,
 ) (bool, godigest.Digest, error) {
 	var oldDgst godigest.Digest
@@ -222,7 +234,7 @@ func CheckIfIndexNeedsUpdate(index *ispec.Index, desc *ispec.Descriptor,
 
 	updateIndex := true
 
-	for midx, manifest := range index.Manifests {
+	for _, manifest := range index.Manifests {
 		if reference == manifest.Digest.String() {
 			// nothing changed, so don't update
 			updateIndex = false
@@ -239,8 +251,8 @@ func CheckIfIndexNeedsUpdate(index *ispec.Index, desc *ispec.Descriptor,
 				break
 			}
 
-			// manifest contents have changed for the same tag,
-			// so update index.json descriptor
+			// Tag overwrite: drop the prior tag (and keep an untagged row when it was
+			// the last reference), same policy as delete-by-tag.
 			log.Info().
 				Int64("old size", manifest.Size).
 				Int64("new size", desc.Size).
@@ -257,14 +269,12 @@ func CheckIfIndexNeedsUpdate(index *ispec.Index, desc *ispec.Descriptor,
 					Str("new mediaType", desc.MediaType).Msg("media-type changed")
 			}
 
-			oldDesc := *desc
+			removed, err := RemoveManifestDescByReference(index, reference, false)
+			if err != nil {
+				return false, "", err
+			}
 
-			desc = &manifest
-			oldDgst = manifest.Digest
-			desc.Size = oldDesc.Size
-			desc.Digest = oldDesc.Digest
-
-			index.Manifests = append(index.Manifests[:midx], index.Manifests[midx+1:]...)
+			oldDgst = removed.Digest
 
 			break
 		}
@@ -827,11 +837,15 @@ func GetReferrers(imgStore storageTypes.ImageStore, repo string, gdigest godiges
 
 		buf, err := imgStore.GetBlobContent(repo, descriptor.Digest)
 		if err != nil {
-			log.Error().Err(err).Str("blob", imgStore.BlobPath(repo, descriptor.Digest)).Msg("failed to read manifest")
+			var pathNotFoundErr driver.PathNotFoundError
+			if errors.Is(err, zerr.ErrBlobNotFound) || errors.As(err, &pathNotFoundErr) {
+				log.Warn().Err(err).Str("blob", imgStore.BlobPath(repo, descriptor.Digest)).
+					Msg("skipping missing blob while listing referrers")
 
-			if errors.Is(err, zerr.ErrBlobNotFound) {
-				return nilIndex, zerr.ErrManifestNotFound
+				continue
 			}
+
+			log.Error().Err(err).Str("blob", imgStore.BlobPath(repo, descriptor.Digest)).Msg("failed to read manifest")
 
 			return nilIndex, err
 		}
@@ -894,19 +908,19 @@ func GetReferrers(imgStore storageTypes.ImageStore, repo string, gdigest godiges
 	}
 
 	return ispec.Index{
-		Versioned:   imeta.Versioned{SchemaVersion: storageConstants.SchemaVersion},
-		MediaType:   ispec.MediaTypeImageIndex,
-		Manifests:   result,
-		Annotations: map[string]string{},
+		SchemaVersion: storageConstants.SchemaVersion,
+		MediaType:     ispec.MediaTypeImageIndex,
+		Manifests:     result,
+		Annotations:   map[string]string{},
 	}, nil
 }
 
 func newEmptyReferrersIndex() ispec.Index {
 	return ispec.Index{
-		Versioned:   imeta.Versioned{SchemaVersion: storageConstants.SchemaVersion},
-		MediaType:   ispec.MediaTypeImageIndex,
-		Manifests:   []ispec.Descriptor{},
-		Annotations: map[string]string{},
+		SchemaVersion: storageConstants.SchemaVersion,
+		MediaType:     ispec.MediaTypeImageIndex,
+		Manifests:     []ispec.Descriptor{},
+		Annotations:   map[string]string{},
 	}
 }
 
@@ -1015,7 +1029,8 @@ func IsSupportedMediaType(compats []compat.MediaCompatibility, mediaType string)
 func IsNonDistributable(mediaType string) bool {
 	return mediaType == ispec.MediaTypeImageLayerNonDistributable || //nolint:staticcheck
 		mediaType == ispec.MediaTypeImageLayerNonDistributableGzip || //nolint:staticcheck
-		mediaType == ispec.MediaTypeImageLayerNonDistributableZstd //nolint:staticcheck
+		mediaType == ispec.MediaTypeImageLayerNonDistributableZstd || //nolint:staticcheck
+		mediaType == docker.MediaTypeForeignLayer
 }
 
 func ValidateManifestSchema(buf []byte) error {

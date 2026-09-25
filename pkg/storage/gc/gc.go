@@ -308,8 +308,7 @@ func (gc GarbageCollect) removeStaleManifestEntries(repo string, index *ispec.In
 
 	allBlobs, err := gc.imgStore.GetAllBlobs(repo)
 	if err != nil {
-		var pathNotFoundErr driver.PathNotFoundError
-		if !errors.As(err, &pathNotFoundErr) {
+		if _, ok := errors.AsType[driver.PathNotFoundError](err); !ok {
 			return err
 		}
 
@@ -707,6 +706,14 @@ func (gc GarbageCollect) removeReferrer(repo string, index *ispec.Index, manifes
 	if ok {
 		if zcommon.IsCosignTag(tag) {
 			subjectDigest := getSubjectFromCosignTag(tag)
+			if err := subjectDigest.Validate(); err != nil {
+				gc.log.Warn().Err(err).Str("module", "gc").Str("repository", repo).
+					Str("reference", tag).Str("digest", manifestDesc.Digest.String()).
+					Msg("invalid cosign tag subject digest, skipping legacy cosign tag prune")
+
+				return gced, nil
+			}
+
 			referenced := isManifestReferencedInIndex(index, subjectDigest)
 
 			if !referenced {
@@ -792,10 +799,14 @@ func (gc GarbageCollect) removeManifestIfOlderThan(repo string, index *ispec.Ind
 
 	canGC, err := isBlobOlderThan(gc.imgStore, repo, desc.Digest, delay, gc.log)
 	if err != nil {
-		gc.log.Error().Err(err).Str("module", "gc").Str("repository", repo).Str("digest", desc.Digest.String()).
-			Str("delay", delay.String()).Msg("failed to check if blob is older than delay")
+		// Do not abort CleanRepo: StatBlob collapses transient storage errors into
+		// ErrBlobNotFound, so we must not treat a miss as age-eligible here. Skip this
+		// row and let removeStaleManifestEntries (GetAllBlobs inventory) drop truly
+		// absent descriptors later in the same CleanRepo pass.
+		gc.log.Warn().Err(err).Str("module", "gc").Str("repository", repo).Str("digest", desc.Digest.String()).
+			Str("delay", delay.String()).Msg("skipping age check after blob stat failure, continuing GC")
 
-		return false, err
+		return false, nil
 	}
 
 	if canGC {
@@ -841,7 +852,14 @@ func (gc GarbageCollect) removeManifest(repo string, index *ispec.Index,
 				SignatureDigest: desc.Digest.String(),
 				SignatureType:   signatureType,
 			})
-			if err != nil {
+			switch {
+			case errors.Is(err, zerr.ErrImageMetaNotFound):
+				// Expected when RemoveRepoReference already deleted Signatures[subject]
+				// (e.g. untagged subject GC after last-tag overwrite left the digest in
+				// index.json, then a later referrer pass removes the signature).
+				gc.log.Debug().Err(err).Str("module", "gc").Str("component", "metadb").
+					Msg("signature meta already removed")
+			case err != nil:
 				gc.log.Error().Err(err).Str("module", "gc").Str("component", "metadb").
 					Msg("failed to remove signature in metaDB")
 
@@ -1092,10 +1110,11 @@ func (gc GarbageCollect) deleteUnreferencedBlobs(repo string, delay time.Duratio
 		if _, ok := refBlobs[digest]; !ok {
 			canGC, err := isBlobOlderThan(gc.imgStore, repo, digest, delay, log)
 			if err != nil {
-				log.Error().Err(err).Str("module", "gc").Str("repository", repo).
-					Str("digest", digest.String()).Msg("failed to determine GC delay")
+				// Skip this candidate; do not abort orphan cleanup for the rest of the repo.
+				log.Warn().Err(err).Str("module", "gc").Str("repository", repo).
+					Str("digest", digest.String()).Msg("skipping orphan blob after StatBlob failure, continuing GC")
 
-				return 0, err
+				continue
 			}
 
 			if canGC {
@@ -1147,9 +1166,13 @@ func isBlobOlderThan(imgStore types.ImageStore, repo string,
 	return true, nil
 }
 
+// getSubjectFromCosignTag parses a legacy cosign tag ("sha256-<digest>.sig"/".sbom") back into
+// the subject digest it refers to. Splitting on the first "-" assumes <digest> itself has no
+// hyphen, true for cosign-generated tags (hex-encoded digests) but not guaranteed for a
+// registry tag in general (any client can push an arbitrarily-named tag matching the
+// IsCosignTag regex). Callers must call Validate() on the result before trusting it.
 func getSubjectFromCosignTag(tag string) godigest.Digest {
-	alg := strings.Split(tag, "-")[0]
-	encoded := strings.Split(tag, "-")[1]
+	alg, encoded, _ := strings.Cut(tag, "-")
 	encoded = strings.TrimSuffix(encoded, "."+cosignSignatureTagSuffix)
 	encoded = strings.TrimSuffix(encoded, "."+SBOMTagSuffix)
 

@@ -1444,9 +1444,14 @@ func (dwr *DynamoDB) DeleteSignature(repo string, signedManifestDigest godigest.
 		return zerr.ErrImageMetaNotFound
 	}
 
-	signatureSlice := manifestSignatures.Map[sigType]
+	// SetRepoReference pre-creates Signatures[digest] without typed entries; missing
+	// types (e.g. signature layer never parsed into meta) are already cleaned.
+	signatureSlice, found := manifestSignatures.Map[sigType]
+	if !found || signatureSlice == nil {
+		return nil
+	}
 
-	newSignatureSlice := make([]*proto_go.SignatureInfo, 0, len(signatureSlice.List)-1)
+	newSignatureSlice := make([]*proto_go.SignatureInfo, 0, len(signatureSlice.List))
 
 	for _, sigDigest := range signatureSlice.List {
 		if sigDigest.SignatureManifestDigest != sigMeta.SignatureDigest {
@@ -2349,8 +2354,7 @@ func (dwr *DynamoDB) tableExists(tableName string) (bool, error) {
 		return true, nil
 	}
 
-	var notFoundErr *types.ResourceNotFoundException
-	if errors.As(err, &notFoundErr) {
+	if _, ok := errors.AsType[*types.ResourceNotFoundException](err); ok {
 		return false, nil
 	}
 
@@ -2375,8 +2379,7 @@ func ignoreResourceInUseError(err error) error {
 		return nil
 	}
 
-	var inUseException *types.ResourceInUseException
-	if errors.As(err, &inUseException) {
+	if _, ok := errors.AsType[*types.ResourceInUseException](err); ok {
 		return nil
 	}
 

@@ -21,6 +21,7 @@ import (
 	. "github.com/smartystreets/goconvey/convey"
 
 	zerr "zotregistry.dev/zot/v2/errors"
+	"zotregistry.dev/zot/v2/pkg/compat"
 	"zotregistry.dev/zot/v2/pkg/extensions/monitoring"
 	"zotregistry.dev/zot/v2/pkg/log"
 	"zotregistry.dev/zot/v2/pkg/storage"
@@ -94,6 +95,7 @@ func TestValidateManifest(t *testing.T) {
 
 		Convey("bad manifest schema version", func() {
 			manifest := ispec.Manifest{
+				SchemaVersion: 999,
 				Config: ispec.Descriptor{
 					MediaType: ispec.MediaTypeImageConfig,
 					Digest:    cdigest,
@@ -107,8 +109,6 @@ func TestValidateManifest(t *testing.T) {
 					},
 				},
 			}
-
-			manifest.SchemaVersion = 999
 
 			body, err := json.Marshal(manifest)
 			So(err, ShouldBeNil)
@@ -125,6 +125,7 @@ func TestValidateManifest(t *testing.T) {
 
 		Convey("bad config blob", func() {
 			manifest := ispec.Manifest{
+				SchemaVersion: 2,
 				Config: ispec.Descriptor{
 					MediaType: ispec.MediaTypeImageConfig,
 					Digest:    cdigest,
@@ -138,8 +139,6 @@ func TestValidateManifest(t *testing.T) {
 					},
 				},
 			}
-
-			manifest.SchemaVersion = 2
 
 			configBlobPath := imgStore.BlobPath("test", cdigest)
 
@@ -173,9 +172,9 @@ func TestValidateManifest(t *testing.T) {
 						Size:      int64(len(content)),
 					},
 				},
-			}
 
-			manifest.SchemaVersion = 2
+				SchemaVersion: 2,
+			}
 
 			body, err := json.Marshal(manifest)
 			So(err, ShouldBeNil)
@@ -192,14 +191,185 @@ func TestValidateManifest(t *testing.T) {
 					Size:      int64(len(cblob)),
 				},
 				Layers: []ispec.Descriptor{},
-			}
 
-			manifest.SchemaVersion = 2
+				SchemaVersion: 2,
+			}
 
 			body, err := json.Marshal(manifest)
 			So(err, ShouldBeNil)
 
 			_, _, err = imgStore.PutImageManifest(context.Background(), "test", "1.0", ispec.MediaTypeImageManifest, body, nil)
+			So(err, ShouldBeNil)
+		})
+
+		Convey("sparse image index with missing child is accepted", func() {
+			manifest := ispec.Manifest{
+				Config: ispec.Descriptor{
+					MediaType: ispec.MediaTypeImageConfig,
+					Digest:    cdigest,
+					Size:      int64(len(cblob)),
+				},
+				Layers: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageLayer,
+						Digest:    digest,
+						Size:      int64(len(content)),
+					},
+				},
+
+				SchemaVersion: 2,
+			}
+
+			body, err := json.Marshal(manifest)
+			So(err, ShouldBeNil)
+
+			manDigest, _, err := imgStore.PutImageManifest(context.Background(), "test", "child",
+				ispec.MediaTypeImageManifest, body, nil)
+			So(err, ShouldBeNil)
+
+			index := ispec.Index{
+				MediaType: ispec.MediaTypeImageIndex,
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    manDigest,
+						Size:      int64(len(body)),
+					},
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    godigest.FromString("missing-arch-child"),
+						Size:      10,
+					},
+				},
+
+				SchemaVersion: 2,
+			}
+
+			indexBody, err := json.Marshal(index)
+			So(err, ShouldBeNil)
+
+			_, _, err = imgStore.PutImageManifest(context.Background(), "test", "sparse",
+				ispec.MediaTypeImageIndex, indexBody, nil)
+			So(err, ShouldBeNil)
+		})
+
+		Convey("sparse docker manifest list with missing child is accepted", func() {
+			compats := []compat.MediaCompatibility{compat.DockerManifestV2SchemaV2}
+
+			list := manifestlist.ManifestList{
+				Manifests: []manifestlist.ManifestDescriptor{
+					{
+						MediaType: docker.MediaTypeManifest,
+						Digest:    godigest.FromString("missing-docker-child"),
+						Size:      10,
+						Platform:  manifestlist.PlatformSpec{Architecture: "amd64", OS: "linux"},
+					},
+				},
+
+				SchemaVersion: 2,
+				MediaType:     manifestlist.MediaTypeManifestList,
+			}
+
+			listBody, err := json.Marshal(list)
+			So(err, ShouldBeNil)
+
+			err = common.ValidateManifest(imgStore, "test", "docker-sparse",
+				manifestlist.MediaTypeManifestList, listBody, compats, log)
+			So(err, ShouldBeNil)
+		})
+
+		Convey("docker image manifest with missing layer is rejected", func() {
+			compats := []compat.MediaCompatibility{compat.DockerManifestV2SchemaV2}
+
+			man := docker.Manifest{
+				Config: ispec.Descriptor{
+					MediaType: docker.MediaTypeImageConfig,
+					Digest:    cdigest,
+					Size:      int64(len(cblob)),
+				},
+				Layers: []ispec.Descriptor{
+					{
+						MediaType: docker.MediaTypeLayer,
+						Digest:    godigest.FromString("missing-docker-layer"),
+						Size:      10,
+					},
+				},
+
+				SchemaVersion: 2,
+				MediaType:     docker.MediaTypeManifest,
+			}
+
+			manBody, err := json.Marshal(man)
+			So(err, ShouldBeNil)
+
+			err = common.ValidateManifest(imgStore, "test", "docker-img",
+				docker.MediaTypeManifest, manBody, compats, log)
+			So(err, ShouldNotBeNil)
+			So(errors.Is(err, zerr.ErrBadManifest), ShouldBeTrue)
+		})
+
+		Convey("docker image manifest skips non-distributable layer blob checks", func() {
+			compats := []compat.MediaCompatibility{compat.DockerManifestV2SchemaV2}
+
+			man := docker.Manifest{
+				Config: ispec.Descriptor{
+					MediaType: docker.MediaTypeImageConfig,
+					Digest:    cdigest,
+					Size:      int64(len(cblob)),
+				},
+				Layers: []ispec.Descriptor{
+					{
+						MediaType: docker.MediaTypeForeignLayer,
+						Digest:    godigest.FromString("foreign-layer-absent"),
+						Size:      10,
+					},
+				},
+
+				SchemaVersion: 2,
+				MediaType:     docker.MediaTypeManifest,
+			}
+
+			manBody, err := json.Marshal(man)
+			So(err, ShouldBeNil)
+
+			err = common.ValidateManifest(imgStore, "test", "docker-foreign",
+				docker.MediaTypeManifest, manBody, compats, log)
+			So(err, ShouldBeNil)
+		})
+
+		Convey("invalid docker manifest list body is rejected", func() {
+			compats := []compat.MediaCompatibility{compat.DockerManifestV2SchemaV2}
+
+			err = common.ValidateManifest(imgStore, "test", "docker-list-bad",
+				manifestlist.MediaTypeManifestList, []byte("{"), compats, log)
+			So(err, ShouldNotBeNil)
+			So(errors.Is(err, zerr.ErrBadManifest), ShouldBeTrue)
+		})
+
+		Convey("invalid OCI image index JSON is rejected", func() {
+			err = common.ValidateManifest(imgStore, "test", "index-bad",
+				ispec.MediaTypeImageIndex, []byte(`{"schemaVersion":2,"manifests":123}`), nil, log)
+			So(err, ShouldNotBeNil)
+			So(errors.Is(err, zerr.ErrBadManifest), ShouldBeTrue)
+		})
+
+		Convey("sparse OCI index with missing child is accepted", func() {
+			index := ispec.Index{
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    godigest.FromString("missing-child"),
+						Size:      1,
+					},
+				},
+
+				SchemaVersion: 2,
+			}
+			body, err := json.Marshal(index)
+			So(err, ShouldBeNil)
+
+			err = common.ValidateManifest(imgStore, "test", "sparse-oci",
+				ispec.MediaTypeImageIndex, body, nil, log)
 			So(err, ShouldBeNil)
 		})
 	})
@@ -265,9 +435,65 @@ func TestGetReferrersErrors(t *testing.T) {
 				},
 			}
 
-			_, err = common.GetReferrers(imgStore, "zot-test", validDigest,
+			idx, err := common.GetReferrers(imgStore, "zot-test", validDigest,
 				[]string{artifactType}, log)
-			So(err, ShouldNotBeNil)
+			So(err, ShouldBeNil)
+			So(idx.Manifests, ShouldBeEmpty)
+		})
+
+		Convey("GetReferrers skips missing blob and returns other referrers", func(c C) {
+			missingDigest := godigest.FromString("missing-referrer")
+			referrerDigest := godigest.FromBytes([]byte("referrer-manifest"))
+
+			index = ispec.Index{
+				Manifests: []ispec.Descriptor{
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    missingDigest,
+					},
+					{
+						MediaType: ispec.MediaTypeImageManifest,
+						Digest:    referrerDigest,
+					},
+				},
+			}
+
+			indexBuf, err = json.Marshal(index)
+			So(err, ShouldBeNil)
+
+			referrerManifest := ispec.Manifest{
+				Subject: &ispec.Descriptor{
+					Digest: validDigest,
+				},
+			}
+			referrerBuf, err := json.Marshal(referrerManifest)
+			So(err, ShouldBeNil)
+
+			imgStore = &mocks.MockedImageStore{
+				GetIndexContentFn: func(repo string) ([]byte, error) {
+					return indexBuf, nil
+				},
+				GetBlobContentFn: func(repo string, dig godigest.Digest) ([]byte, error) {
+					if dig == missingDigest {
+						return nil, zerr.ErrBlobNotFound
+					}
+
+					if dig == referrerDigest {
+						return referrerBuf, nil
+					}
+
+					return nil, zerr.ErrBlobNotFound
+				},
+				BlobPathFn: func(repo string, digest godigest.Digest) string {
+					return digest.String()
+				},
+			}
+
+			idx, err := common.GetReferrers(imgStore, "zot-test", validDigest,
+				[]string{}, log)
+			So(err, ShouldBeNil)
+			So(len(idx.Manifests), ShouldEqual, 1)
+			So(idx.Manifests[0].Digest, ShouldEqual, referrerDigest)
 		})
 
 		Convey("Trigger GetBlobContent() generic error", func(c C) {
@@ -467,6 +693,91 @@ func TestGetReferrersDeduplication(t *testing.T) {
 		So(err, ShouldBeNil)
 		So(len(referrers.Manifests), ShouldEqual, 1)
 		So(referrers.Manifests[0].Digest, ShouldEqual, referrerDigest)
+	})
+}
+
+func TestUpdateIndexOnTagOverwriteRetainsOrphanedDigest(t *testing.T) {
+	log := log.NewTestLogger()
+
+	Convey("overwriting last tag retains untagged descriptor for previous digest", t, func() {
+		oldDigest := godigest.FromBytes([]byte("old-manifest"))
+		newDigest := godigest.FromBytes([]byte("new-manifest"))
+
+		index := ispec.Index{
+			Manifests: []ispec.Descriptor{
+				{
+					MediaType: ispec.MediaTypeImageManifest,
+					Digest:    oldDigest,
+					Size:      10,
+					Annotations: map[string]string{
+						ispec.AnnotationRefName: "latest",
+					},
+				},
+			},
+		}
+
+		desc := ispec.Descriptor{
+			MediaType: ispec.MediaTypeImageManifest,
+			Digest:    newDigest,
+			Size:      11,
+			Annotations: map[string]string{
+				ispec.AnnotationRefName: "latest",
+			},
+		}
+
+		update, oldDgst, err := common.UpdateIndexOnTagOverwrite(&index, &desc, log)
+		So(err, ShouldBeNil)
+		So(update, ShouldBeTrue)
+		So(oldDgst, ShouldEqual, oldDigest)
+
+		So(len(index.Manifests), ShouldEqual, 1)
+		So(index.Manifests[0].Digest, ShouldEqual, oldDigest)
+		_, hasTag := index.Manifests[0].Annotations[ispec.AnnotationRefName]
+		So(hasTag, ShouldBeFalse)
+	})
+
+	Convey("overwriting one of several tags for same digest does not add untagged row", t, func() {
+		oldDigest := godigest.FromBytes([]byte("shared-manifest"))
+		newDigest := godigest.FromBytes([]byte("replacement"))
+
+		index := ispec.Index{
+			Manifests: []ispec.Descriptor{
+				{
+					MediaType: ispec.MediaTypeImageManifest,
+					Digest:    oldDigest,
+					Size:      10,
+					Annotations: map[string]string{
+						ispec.AnnotationRefName: "a",
+					},
+				},
+				{
+					MediaType: ispec.MediaTypeImageManifest,
+					Digest:    oldDigest,
+					Size:      10,
+					Annotations: map[string]string{
+						ispec.AnnotationRefName: "b",
+					},
+				},
+			},
+		}
+
+		desc := ispec.Descriptor{
+			MediaType: ispec.MediaTypeImageManifest,
+			Digest:    newDigest,
+			Size:      11,
+			Annotations: map[string]string{
+				ispec.AnnotationRefName: "a",
+			},
+		}
+
+		update, oldDgst, err := common.UpdateIndexOnTagOverwrite(&index, &desc, log)
+		So(err, ShouldBeNil)
+		So(update, ShouldBeTrue)
+		So(oldDgst, ShouldEqual, oldDigest)
+
+		So(len(index.Manifests), ShouldEqual, 1)
+		So(index.Manifests[0].Digest, ShouldEqual, oldDigest)
+		So(index.Manifests[0].Annotations[ispec.AnnotationRefName], ShouldEqual, "b")
 	})
 }
 
