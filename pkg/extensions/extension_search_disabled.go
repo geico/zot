@@ -3,8 +3,11 @@
 package extensions
 
 import (
+	"context"
+
 	"github.com/gorilla/mux"
 
+	zerr "zotregistry.dev/zot/v2/errors"
 	"zotregistry.dev/zot/v2/pkg/api/config"
 	"zotregistry.dev/zot/v2/pkg/extensions/events"
 	"zotregistry.dev/zot/v2/pkg/log"
@@ -14,6 +17,10 @@ import (
 )
 
 type CveScanner any
+
+func ScanRawReport(_ context.Context, _ CveScanner, _ string) ([]byte, error) {
+	return nil, zerr.ErrCVESearchDisabled
+}
 
 func GetCveScanner(config *config.Config, storeController storage.StoreController,
 	metaDB mTypes.MetaDB, eventRecorder events.Recorder, log log.Logger,

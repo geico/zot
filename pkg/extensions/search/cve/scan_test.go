@@ -847,3 +847,57 @@ func TestScanGeneratorPublishesScanEvents(t *testing.T) {
 		So(recorder.ImageScannedCalls, ShouldHaveLength, 1)
 	})
 }
+
+func TestRawReportPublishesScanEvents(t *testing.T) {
+	Convey("a raw report request performs a real scan, so it publishes one event", t, func() {
+		params := boltdb.DBParameters{
+			RootDir: t.TempDir(),
+		}
+		boltDriver, err := boltdb.GetBoltDriver(params)
+		So(err, ShouldBeNil)
+
+		metaDB, err := boltdb.New(boltDriver, log.NewTestLogger())
+		So(err, ShouldBeNil)
+
+		image := CreateImageWith().DefaultLayers().DefaultConfig().Build()
+		err = metaDB.SetRepoReference(context.Background(), "repo", "1.0.0", image.AsImageMeta())
+		So(err, ShouldBeNil)
+
+		cached := false
+		mockScanner := mockScannerReturningCVEs(metaDB)
+		innerScanImageFn := mockScanner.ScanImageFn
+		mockScanner.ScanRawReportFn = func(ctx context.Context, img string) (cvemodel.RawScanResult, error) {
+			result, err := innerScanImageFn(ctx, img)
+			if err != nil {
+				return cvemodel.RawScanResult{}, err
+			}
+
+			return cvemodel.RawScanResult{
+				ReportJSON: []byte(`{"SchemaVersion":2}`),
+				CVEMap:     result.CVEMap,
+				Digest:     result.Digest,
+				MediaType:  result.MediaType,
+				WasCached:  cached,
+			}, nil
+		}
+
+		recorder := &mocks.EventRecorderMock{}
+		scanner := cveinfo.NewDecoratedScanner(mockScanner, log.NewTestLogger(),
+			cveinfo.WithEventRecorder(recorder))
+
+		_, err = scanner.ScanRawReport(context.Background(), "repo:1.0.0")
+		So(err, ShouldBeNil)
+		So(recorder.ImageScannedCalls, ShouldHaveLength, 1)
+
+		call := recorder.ImageScannedCalls[0]
+		So(call.Reference, ShouldEqual, "1.0.0")
+		So(call.Digest, ShouldEqual, image.DigestStr())
+		checkScanEventSummary(call)
+
+		cached = true
+
+		_, err = scanner.ScanRawReport(context.Background(), "repo:1.0.0")
+		So(err, ShouldBeNil)
+		So(recorder.ImageScannedCalls, ShouldHaveLength, 1)
+	})
+}

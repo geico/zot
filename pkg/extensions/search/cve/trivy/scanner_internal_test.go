@@ -3,6 +3,7 @@
 package trivy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1765,6 +1766,7 @@ func TestScannerCacheMissWithMultipleCallersSynchronization(t *testing.T) {
 		So(calls.Get(scanPath), ShouldEqual, 1)
 
 		scanner.cache.Purge()
+		scanner.rawReportCache.Purge()
 		runWave()
 
 		So(calls.Len(), ShouldEqual, 1)
@@ -1861,6 +1863,7 @@ func TestScannerCacheMissWithMultipleCallersSynchronization(t *testing.T) {
 		So(calls.Get(scanPath2), ShouldEqual, 1)
 
 		scanner.cache.Purge()
+		scanner.rawReportCache.Purge()
 		runWave()
 
 		So(calls.Len(), ShouldEqual, 2)
@@ -2344,6 +2347,562 @@ func TestScanIndexCallerCancellationDoesNotAffectSharedScan(t *testing.T) {
 
 		So(atomic.LoadInt32(&scanCalls), ShouldEqual, 1)
 	})
+}
+
+func TestRawAndCveScansShareManifestFlight(t *testing.T) {
+	tempDir := t.TempDir()
+	logger := log.NewTestLogger()
+	storeController, err := initMockStoreWithFakeScannerDB(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	image := CreateRandomImage()
+	metaDB := mocks.MetaDBMock{
+		GetImageMetaFn: func(digest godigest.Digest) (types.ImageMeta, error) {
+			if digest.String() != image.DigestStr() {
+				return types.ImageMeta{}, zerr.ErrManifestNotFound
+			}
+
+			return image.AsImageMeta(), nil
+		},
+		GetRepoMetaFn: func(ctx context.Context, repo string) (types.RepoMeta, error) {
+			return types.RepoMeta{
+				Name: repo,
+				Tags: map[types.Tag]types.Descriptor{
+					"1.0": {
+						Digest:    image.DigestStr(),
+						MediaType: image.Manifest.MediaType,
+					},
+				},
+			}, nil
+		},
+	}
+
+	scanner := NewScanner(storeController, metaDB, &extconf.CVEConfig{
+		Trivy: &extconf.TrivyConfig{DBRepository: "ghcr.io/project-zot/trivy-db"},
+	}, logger)
+
+	calls := newCallCounter()
+	var gate atomic.Pointer[flightGate]
+	oldNewArtifactRunner := newArtifactRunner
+	newArtifactRunner = func(ctx context.Context, opts flag.Options, target artifact.TargetKind,
+		runnerOpts ...artifact.RunnerOption,
+	) (artifact.Runner, error) {
+		return fakeArtifactRunner{
+			scanImageFn: func(ctx context.Context, opts flag.Options) (trivyTypes.Report, error) {
+				calls.Incr(opts.Target)
+				gate.Load().Hold()
+
+				return trivyTypes.Report{
+					SchemaVersion: 2,
+					ArtifactName:  "shared-report",
+					Results: []trivyTypes.Result{{
+						Target: "shared-target",
+						Vulnerabilities: []trivyTypes.DetectedVulnerability{{
+							VulnerabilityID: "CVE-2026-0001",
+							PkgName:         "example-package",
+						}},
+					}},
+				}, nil
+			},
+		}, nil
+	}
+	defer func() {
+		newArtifactRunner = oldNewArtifactRunner
+	}()
+
+	assertRawAndCveScanWave(t, scanner, image.DigestStr(), calls, &gate, false, 1)
+	scanner.cache.Purge()
+	scanner.rawReportCache.Purge()
+	assertRawAndCveScanWave(t, scanner, image.DigestStr(), calls, &gate, true, 2)
+}
+
+// Most deployments never call the raw endpoint, so a CVE scan must not serialize or retain a
+// report on their behalf. A later raw request pays for its own scan.
+func TestCveScanDoesNotPopulateRawReportCache(t *testing.T) {
+	tempDir := t.TempDir()
+	logger := log.NewTestLogger()
+
+	storeController, err := initMockStoreWithFakeScannerDB(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	image := CreateRandomImage()
+	metaDB := mocks.MetaDBMock{
+		GetImageMetaFn: func(digest godigest.Digest) (types.ImageMeta, error) {
+			if digest.String() != image.DigestStr() {
+				return types.ImageMeta{}, zerr.ErrManifestNotFound
+			}
+
+			return image.AsImageMeta(), nil
+		},
+		GetRepoMetaFn: func(_ context.Context, repo string) (types.RepoMeta, error) {
+			return types.RepoMeta{
+				Name: repo,
+				Tags: map[types.Tag]types.Descriptor{
+					"1.0": {Digest: image.DigestStr(), MediaType: image.Manifest.MediaType},
+				},
+			}, nil
+		},
+	}
+
+	scanner := NewScanner(storeController, metaDB, &extconf.CVEConfig{
+		Trivy: &extconf.TrivyConfig{DBRepository: "ghcr.io/project-zot/trivy-db"},
+	}, logger)
+
+	scans := 0
+	oldNewArtifactRunner := newArtifactRunner
+	newArtifactRunner = func(_ context.Context, _ flag.Options, _ artifact.TargetKind,
+		_ ...artifact.RunnerOption,
+	) (artifact.Runner, error) {
+		return fakeArtifactRunner{
+			scanImageFn: func(_ context.Context, opts flag.Options) (trivyTypes.Report, error) {
+				scans++
+
+				return trivyTypes.Report{SchemaVersion: 2, ArtifactName: opts.Target}, nil
+			},
+		}, nil
+	}
+
+	defer func() {
+		newArtifactRunner = oldNewArtifactRunner
+	}()
+
+	if _, err := scanner.ScanImage(context.Background(), "repo:1.0"); err != nil {
+		t.Fatalf("unexpected error scanning for CVEs: %v", err)
+	}
+
+	if scans != 1 {
+		t.Fatalf("expected one scan, got %d", scans)
+	}
+
+	if _, ok := scanner.getCachedRawReport("repo", image.DigestStr()); ok {
+		t.Fatal("a CVE-only scan must not populate the raw report cache")
+	}
+
+	if used := scanner.rawReportCache.UsedBytes(); used != 0 {
+		t.Fatalf("expected no raw report bytes retained, got %d", used)
+	}
+
+	// the raw path then scans for itself, and caches the report for subsequent requests
+	result, err := scanner.ScanRawReport(context.Background(), "repo:1.0")
+	if err != nil {
+		t.Fatalf("unexpected error requesting the raw report: %v", err)
+	}
+
+	if scans != 2 {
+		t.Fatalf("expected the raw request to trigger its own scan, got %d scans", scans)
+	}
+
+	if artifact := artifactNameFromJSON(t, result.ReportJSON); artifact == "" {
+		t.Fatal("expected a populated report from the raw request")
+	}
+
+	if _, ok := scanner.getCachedRawReport("repo", image.DigestStr()); !ok {
+		t.Fatal("expected the raw request to cache its report")
+	}
+
+	cached, err := scanner.ScanRawReport(context.Background(), "repo:1.0")
+	if err != nil {
+		t.Fatalf("unexpected error on cached raw request: %v", err)
+	}
+
+	if scans != 2 {
+		t.Fatalf("expected the cached raw request to skip scanning, got %d scans", scans)
+	}
+
+	if !bytes.Equal(cached.ReportJSON, result.ReportJSON) {
+		t.Fatalf("cached raw report differs:\nfirst:  %s\nsecond: %s", result.ReportJSON, cached.ReportJSON)
+	}
+}
+
+// A Trivy report records the repo path it was scanned from, so two repos sharing a digest must
+// each get their own report rather than whichever one happened to be scanned first.
+func TestRawReportCacheIsScopedPerRepo(t *testing.T) {
+	tempDir := t.TempDir()
+	logger := log.NewTestLogger()
+
+	storeController, err := initMockStoreWithFakeScannerDB(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	image := CreateRandomImage()
+	metaDB := mocks.MetaDBMock{
+		GetImageMetaFn: func(digest godigest.Digest) (types.ImageMeta, error) {
+			if digest.String() != image.DigestStr() {
+				return types.ImageMeta{}, zerr.ErrManifestNotFound
+			}
+
+			return image.AsImageMeta(), nil
+		},
+	}
+
+	scanner := NewScanner(storeController, metaDB, &extconf.CVEConfig{
+		Trivy: &extconf.TrivyConfig{DBRepository: "ghcr.io/project-zot/trivy-db"},
+	}, logger)
+
+	calls := newCallCounter()
+	oldNewArtifactRunner := newArtifactRunner
+	newArtifactRunner = func(_ context.Context, _ flag.Options, _ artifact.TargetKind,
+		_ ...artifact.RunnerOption,
+	) (artifact.Runner, error) {
+		return fakeArtifactRunner{
+			scanImageFn: func(_ context.Context, opts flag.Options) (trivyTypes.Report, error) {
+				calls.Incr(opts.Target)
+
+				return trivyTypes.Report{SchemaVersion: 2, ArtifactName: opts.Target}, nil
+			},
+		}, nil
+	}
+
+	defer func() {
+		newArtifactRunner = oldNewArtifactRunner
+	}()
+
+	reportA, err := scanner.ScanRawReport(context.Background(), "repo-a@"+image.DigestStr())
+	if err != nil {
+		t.Fatalf("unexpected error scanning repo-a: %v", err)
+	}
+
+	reportB, err := scanner.ScanRawReport(context.Background(), "repo-b@"+image.DigestStr())
+	if err != nil {
+		t.Fatalf("unexpected error scanning repo-b: %v", err)
+	}
+
+	artifactA := artifactNameFromJSON(t, reportA.ReportJSON)
+	artifactB := artifactNameFromJSON(t, reportB.ReportJSON)
+
+	if !strings.Contains(artifactA, "repo-a@") {
+		t.Fatalf("repo-a got a report for another repo: %q", artifactA)
+	}
+
+	if !strings.Contains(artifactB, "repo-b@") {
+		t.Fatalf("repo-b got a report for another repo: %q", artifactB)
+	}
+
+	if calls.Len() != 2 {
+		t.Fatalf("expected each repo to be scanned separately, got %d distinct targets", calls.Len())
+	}
+
+	// repo-a is now cached, so a repeat request must not trigger another scan.
+	cachedA, err := scanner.ScanRawReport(context.Background(), "repo-a@"+image.DigestStr())
+	if err != nil {
+		t.Fatalf("unexpected error on cached repo-a scan: %v", err)
+	}
+
+	if !bytes.Equal(cachedA.ReportJSON, reportA.ReportJSON) {
+		t.Fatalf("cached report mismatch: got %s want %s", cachedA.ReportJSON, reportA.ReportJSON)
+	}
+
+	if got := calls.Get(artifactA); got != 1 {
+		t.Fatalf("expected repo-a to be scanned once, got %d", got)
+	}
+}
+
+func artifactNameFromJSON(t *testing.T, reportJSON []byte) string {
+	t.Helper()
+
+	var report trivyTypes.Report
+	if err := json.Unmarshal(reportJSON, &report); err != nil {
+		t.Fatalf("raw report is not valid JSON: %v", err)
+	}
+
+	return report.ArtifactName
+}
+
+// The whole point of the raw endpoint is that nothing is dropped: fields the CVE conversion
+// discards (PublishedDate, CVSS, references) and result groups that carry no vulnerabilities
+// at all (licenses) must survive to the response.
+// A tag and the digest it resolves to must converge on a single scan and a single cached report.
+func TestRawReportTagAndDigestShareOneResult(t *testing.T) {
+	tempDir := t.TempDir()
+	logger := log.NewTestLogger()
+
+	storeController, err := initMockStoreWithFakeScannerDB(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	image := CreateRandomImage()
+	metaDB := mocks.MetaDBMock{
+		GetImageMetaFn: func(digest godigest.Digest) (types.ImageMeta, error) {
+			if digest.String() != image.DigestStr() {
+				return types.ImageMeta{}, zerr.ErrManifestNotFound
+			}
+
+			return image.AsImageMeta(), nil
+		},
+		GetRepoMetaFn: func(_ context.Context, repo string) (types.RepoMeta, error) {
+			return types.RepoMeta{
+				Name: repo,
+				Tags: map[types.Tag]types.Descriptor{
+					"1.0": {Digest: image.DigestStr(), MediaType: image.Manifest.MediaType},
+				},
+			}, nil
+		},
+	}
+
+	scanner := NewScanner(storeController, metaDB, &extconf.CVEConfig{
+		Trivy: &extconf.TrivyConfig{DBRepository: "ghcr.io/project-zot/trivy-db"},
+	}, logger)
+
+	calls := newCallCounter()
+	oldNewArtifactRunner := newArtifactRunner
+	newArtifactRunner = func(_ context.Context, _ flag.Options, _ artifact.TargetKind,
+		_ ...artifact.RunnerOption,
+	) (artifact.Runner, error) {
+		return fakeArtifactRunner{
+			scanImageFn: func(_ context.Context, opts flag.Options) (trivyTypes.Report, error) {
+				calls.Incr(opts.Target)
+
+				return trivyTypes.Report{SchemaVersion: 2, ArtifactName: opts.Target}, nil
+			},
+		}, nil
+	}
+
+	defer func() {
+		newArtifactRunner = oldNewArtifactRunner
+	}()
+
+	byTag, err := scanner.ScanRawReport(context.Background(), "repo:1.0")
+	if err != nil {
+		t.Fatalf("unexpected error scanning by tag: %v", err)
+	}
+
+	byDigest, err := scanner.ScanRawReport(context.Background(), "repo@"+image.DigestStr())
+	if err != nil {
+		t.Fatalf("unexpected error scanning by digest: %v", err)
+	}
+
+	if !bytes.Equal(byTag.ReportJSON, byDigest.ReportJSON) {
+		t.Fatalf("tag and digest produced different reports:\ntag:    %s\ndigest: %s",
+			byTag.ReportJSON, byDigest.ReportJSON)
+	}
+
+	if byTag.Digest != image.DigestStr() || byDigest.Digest != image.DigestStr() {
+		t.Fatalf("expected both requests to resolve to %s, got %q and %q",
+			image.DigestStr(), byTag.Digest, byDigest.Digest)
+	}
+
+	if byTag.WasCached {
+		t.Fatal("expected the first request to perform a scan")
+	}
+
+	if !byDigest.WasCached {
+		t.Fatal("expected the digest request to reuse the report scanned for the tag")
+	}
+
+	if calls.Len() != 1 {
+		t.Fatalf("expected a single scan for both references, got %d distinct targets", calls.Len())
+	}
+}
+
+func TestRawReportPreservesFieldsDroppedByCVEConversion(t *testing.T) {
+	tempDir := t.TempDir()
+	logger := log.NewTestLogger()
+
+	storeController, err := initMockStoreWithFakeScannerDB(tempDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	image := CreateRandomImage()
+	metaDB := mocks.MetaDBMock{
+		GetImageMetaFn: func(digest godigest.Digest) (types.ImageMeta, error) {
+			if digest.String() != image.DigestStr() {
+				return types.ImageMeta{}, zerr.ErrManifestNotFound
+			}
+
+			return image.AsImageMeta(), nil
+		},
+	}
+
+	scanner := NewScanner(storeController, metaDB, &extconf.CVEConfig{
+		Trivy: &extconf.TrivyConfig{DBRepository: "ghcr.io/project-zot/trivy-db"},
+	}, logger)
+
+	published := time.Date(2026, time.March, 4, 5, 6, 7, 0, time.UTC)
+	lastModified := time.Date(2026, time.April, 8, 9, 10, 11, 0, time.UTC)
+
+	oldNewArtifactRunner := newArtifactRunner
+	newArtifactRunner = func(_ context.Context, _ flag.Options, _ artifact.TargetKind,
+		_ ...artifact.RunnerOption,
+	) (artifact.Runner, error) {
+		return fakeArtifactRunner{
+			scanImageFn: func(_ context.Context, _ flag.Options) (trivyTypes.Report, error) {
+				return trivyTypes.Report{
+					SchemaVersion: 2,
+					ArtifactName:  "preserved-artifact",
+					Results: []trivyTypes.Result{
+						{
+							Target: "app (alpine 3.20)",
+							Class:  "os-pkgs",
+							Type:   "alpine",
+							Vulnerabilities: []trivyTypes.DetectedVulnerability{{
+								VulnerabilityID: "CVE-2026-0001",
+								PkgName:         "openssl",
+								PrimaryURL:      "https://example.test/cve-2026-0001",
+								Vulnerability: dbTypes.Vulnerability{
+									Title:            "example vulnerability",
+									Description:      "example description",
+									Severity:         "HIGH",
+									PublishedDate:    &published,
+									LastModifiedDate: &lastModified,
+									References:       []string{"https://example.test/advisory"},
+									CweIDs:           []string{"CWE-79"},
+									CVSS: dbTypes.VendorCVSS{
+										"nvd": {V3Score: 9.8, V3Vector: "CVSS:3.1/AV:N/AC:L"},
+									},
+								},
+							}},
+						},
+						{
+							Target:   "OS Packages",
+							Class:    "license",
+							Licenses: []trivyTypes.DetectedLicense{{Name: "MIT", PkgName: "openssl", Severity: "LOW"}},
+						},
+					},
+				}, nil
+			},
+		}, nil
+	}
+
+	defer func() {
+		newArtifactRunner = oldNewArtifactRunner
+	}()
+
+	result, err := scanner.ScanRawReport(context.Background(), "repo@"+image.DigestStr())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var report trivyTypes.Report
+	if err := json.Unmarshal(result.ReportJSON, &report); err != nil {
+		t.Fatalf("raw report is not valid JSON: %v", err)
+	}
+
+	if len(report.Results) != 2 {
+		t.Fatalf("expected both result groups to be preserved, got %d", len(report.Results))
+	}
+
+	vuln := report.Results[0].Vulnerabilities[0]
+
+	if vuln.PublishedDate == nil || !vuln.PublishedDate.Equal(published) {
+		t.Fatalf("PublishedDate not preserved: %v", vuln.PublishedDate)
+	}
+
+	if vuln.LastModifiedDate == nil || !vuln.LastModifiedDate.Equal(lastModified) {
+		t.Fatalf("LastModifiedDate not preserved: %v", vuln.LastModifiedDate)
+	}
+
+	if got := vuln.CVSS["nvd"].V3Score; got != 9.8 {
+		t.Fatalf("CVSS not preserved: %v", report.Results[0].Vulnerabilities[0].CVSS)
+	}
+
+	if len(vuln.References) != 1 || len(vuln.CweIDs) != 1 {
+		t.Fatalf("references/CWE ids not preserved: %+v", vuln)
+	}
+
+	licenses := report.Results[1].Licenses
+	if len(licenses) != 1 || licenses[0].Name != "MIT" {
+		t.Fatalf("license result group not preserved: %+v", report.Results[1])
+	}
+
+	// the CVE map derived from the same scan keeps none of this, which is why the raw path exists
+	if _, ok := result.CVEMap["CVE-2026-0001"]; !ok {
+		t.Fatal("expected the shared CVE map to still be derived from the same report")
+	}
+}
+
+type cveScanOutcome struct {
+	result model.ScanResult
+	err    error
+}
+
+type rawScanOutcome struct {
+	reportJSON []byte
+	err        error
+}
+
+func assertRawAndCveScanWave(t *testing.T, scanner *Scanner, digest string, calls *callCounter,
+	gate *atomic.Pointer[flightGate], rawLeads bool, expectedScanCount int,
+) {
+	t.Helper()
+	flight := newFlightGate()
+	gate.Store(flight)
+	cveDone := make(chan cveScanOutcome, 1)
+	rawDone := make(chan rawScanOutcome, 1)
+	startCVE := func() {
+		go func() {
+			result, err := scanner.ScanImage(context.Background(), "repo:1.0")
+			cveDone <- cveScanOutcome{result: result, err: err}
+		}()
+	}
+	startRaw := func() {
+		go func() {
+			result, err := scanner.ScanRawReport(context.Background(), "repo:1.0")
+			rawDone <- rawScanOutcome{reportJSON: result.ReportJSON, err: err}
+		}()
+	}
+
+	starts := [2]func(){startCVE, startRaw}
+	leadIndex := 0
+	if rawLeads {
+		leadIndex = 1
+	}
+	starts[leadIndex]()
+	flight.WaitStarted(t)
+	starts[1-leadIndex]()
+	time.Sleep(100 * time.Millisecond)
+	flight.Release()
+
+	assertCveScanOutcome(t, <-cveDone)
+	rawOutcome := <-rawDone
+	assertRawScanOutcome(t, rawOutcome)
+
+	cachedReport, err := scanner.ScanRawReport(context.Background(), "repo:1.0")
+	if err != nil {
+		t.Fatalf("cached raw report request failed: %v", err)
+	}
+
+	if !bytes.Equal(cachedReport.ReportJSON, rawOutcome.reportJSON) {
+		t.Fatalf("cached report JSON differs from uncached report:\nuncached: %s\ncached:   %s",
+			rawOutcome.reportJSON, cachedReport.ReportJSON)
+	}
+
+	scanPath := path.Join(scanner.storeController.DefaultStore.RootDir(), "repo@"+digest)
+	if got := calls.Get(scanPath); got != expectedScanCount {
+		t.Fatalf("expected %d shared scans, got %d", expectedScanCount, got)
+	}
+}
+
+func assertCveScanOutcome(t *testing.T, outcome cveScanOutcome) {
+	t.Helper()
+	if outcome.err != nil {
+		t.Fatalf("CVE scan failed: %v", outcome.err)
+	}
+	if _, ok := outcome.result.CVEMap["CVE-2026-0001"]; !ok {
+		t.Fatal("CVE result was not derived from the shared report")
+	}
+}
+
+func assertRawScanOutcome(t *testing.T, outcome rawScanOutcome) {
+	t.Helper()
+	if outcome.err != nil {
+		t.Fatalf("raw report scan failed: %v", outcome.err)
+	}
+
+	var report trivyTypes.Report
+	if err := json.Unmarshal(outcome.reportJSON, &report); err != nil {
+		t.Fatalf("raw report is not valid JSON: %v", err)
+	}
+
+	if report.ArtifactName != "shared-report" || report.Results[0].Target != "shared-target" {
+		t.Fatalf("raw report did not preserve native Trivy data: %#v", report)
+	}
 }
 
 func TestScanIndexConcurrentCyclicRootsDoNotDeadlock(t *testing.T) {
