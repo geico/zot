@@ -203,6 +203,16 @@ func (rh *RouteHandler) SetupRoutes() {
 			),
 		).Methods(http.MethodGet, http.MethodOptions)
 
+		// registered after the dist-spec routes: {name} accepts slashes, so an earlier registration
+		// would capture paths like /v2/<repo>/manifests/vulnerabilities as name="<repo>/manifests".
+		// GET only, with no CORS headers: this endpoint has no browser consumer, and registering
+		// OPTIONS would hand preflights to the handler unauthorized, since authz skips OPTIONS.
+		if rh.c.CveScanner != nil {
+			prefixedDistSpecRouter.HandleFunc(fmt.Sprintf("/{name:%s}/vulnerabilities", zreg.NameRegexp.String()),
+				clusterRouteProxy(rh.GetRawVulnerabilities),
+			).Methods(http.MethodGet).Name(constants.RawVulnerabilitiesRouteName)
+		}
+
 		// handlers which work fine with a single node do not need proxying.
 		// catalog handler doesn't require proxying as the metadata and storage are shared.
 		// discover and the default path handlers are node-specific so do not require proxying.
@@ -503,6 +513,117 @@ func (rh *RouteHandler) CheckManifest(response http.ResponseWriter, request *htt
 	response.Header().Set("Content-Length", strconv.Itoa(len(content)))
 	response.Header().Set("Content-Type", mediaType)
 	response.WriteHeader(http.StatusOK)
+}
+
+// GetRawVulnerabilities godoc
+// @Summary Get the native Trivy vulnerability report
+// @Description Get the complete, unmodified Trivy report for an image, given a tag or a digest
+// @Accept  json
+// @Produce json
+// @Param   name    path    string    true    "repository name"
+// @Param   ref     query   string    true    "image tag or manifest digest"
+// @Success 200 {string} string "ok"
+// @Failure 400 {string} string "bad request"
+// @Failure 404 {string} string "not found"
+// @Failure 415 {string} string "unsupported media type"
+// @Failure 500 {string} string "internal server error"
+// @Failure 501 {string} string "not implemented"
+// @Router /v2/{name}/vulnerabilities [get].
+func (rh *RouteHandler) GetRawVulnerabilities(response http.ResponseWriter, request *http.Request) {
+	vars := mux.Vars(request)
+
+	name, ok := vars["name"]
+
+	if !ok || name == "" {
+		response.WriteHeader(http.StatusNotFound)
+
+		return
+	}
+
+	ref, ok := rawVulnerabilityReference(response, request, name)
+	if !ok {
+		return
+	}
+
+	// Reference resolution, media type checks and scannability all belong to the scanner, which
+	// resolves from metaDB exactly as the existing CVE APIs do.
+	report, err := ext.ScanRawReport(request.Context(), rh.c.CveScanner,
+		zcommon.GetFullImageName(name, ref))
+	if err != nil {
+		rh.writeRawVulnerabilityError(response, name, ref, err)
+
+		return
+	}
+
+	response.Header().Set("Content-Type", "application/json")
+	response.WriteHeader(http.StatusOK)
+	if _, err = response.Write(report); err != nil {
+		rh.c.Log.Error().Err(err).Str("repository", name).Str("reference", ref).
+			Msg("failed to write raw Trivy vulnerability report")
+	}
+}
+
+// rawVulnerabilityReference returns the single ref query parameter, writing the 400 itself when
+// the request is malformed, so the handler and the authz middleware cannot disagree on which
+// references are acceptable.
+func rawVulnerabilityReference(response http.ResponseWriter, request *http.Request, name string,
+) (string, bool) {
+	refs := request.URL.Query()["ref"]
+	if len(refs) == 1 && (zcommon.IsDigest(refs[0]) || zreg.IsDistributionSpecTag(refs[0])) {
+		return refs[0], true
+	}
+
+	apiError := apiErr.NewError(apiErr.MANIFEST_INVALID).AddDetail(map[string]string{
+		"name":   name,
+		"reason": "exactly one valid tag or digest ref query parameter is required",
+	})
+	zcommon.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(apiError))
+
+	return "", false
+}
+
+// isRawVulnerabilitiesRequest matches on the registered route rather than the URL path, because a
+// path suffix would also match unrelated dist-spec routes such as a manifest tagged "vulnerabilities".
+func isRawVulnerabilitiesRequest(request *http.Request) bool {
+	route := mux.CurrentRoute(request)
+
+	return route != nil && route.GetName() == constants.RawVulnerabilitiesRouteName
+}
+
+func (rh *RouteHandler) writeRawVulnerabilityError(response http.ResponseWriter, name, ref string, err error) {
+	details := map[string]string{"name": name, "reference": ref, "reason": err.Error()}
+	switch {
+	case errors.Is(err, zerr.ErrRepoNotFound), errors.Is(err, zerr.ErrRepoMetaNotFound):
+		apiError := apiErr.NewError(apiErr.NAME_UNKNOWN).AddDetail(details)
+		zcommon.WriteJSON(response, http.StatusNotFound, apiErr.NewErrorList(apiError))
+	case errors.Is(err, zerr.ErrManifestNotFound), errors.Is(err, zerr.ErrTagMetaNotFound):
+		apiError := apiErr.NewError(apiErr.MANIFEST_UNKNOWN).AddDetail(details)
+		zcommon.WriteJSON(response, http.StatusNotFound, apiErr.NewErrorList(apiError))
+	case errors.Is(err, zerr.ErrScanNotSupported):
+		apiError := apiErr.NewError(apiErr.UNSUPPORTED).AddDetail(details)
+		zcommon.WriteJSON(response, http.StatusUnsupportedMediaType, apiErr.NewErrorList(apiError))
+	case errors.Is(err, zerr.ErrCVESearchDisabled):
+		apiError := apiErr.NewError(apiErr.UNSUPPORTED).AddDetail(details)
+		zcommon.WriteJSON(response, http.StatusNotImplemented, apiErr.NewErrorList(apiError))
+	default:
+		// a client that gave up waiting is routine, so it is not logged as a server fault; the
+		// response still carries a failure status so an aborted scan is never mistaken for an
+		// empty report.
+		event := rh.c.Log.Error()
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			event = rh.c.Log.Info()
+		}
+
+		event.Err(err).Str("repository", name).Str("reference", ref).
+			Msg("failed to scan image for raw Trivy vulnerability report")
+
+		// the reason is omitted here: an arbitrary internal error may expose storage paths
+		apiError := apiErr.NewError(apiErr.MANIFEST_INVALID).AddDetail(map[string]string{
+			"name":      name,
+			"reference": ref,
+		})
+		zcommon.WriteJSON(response, http.StatusInternalServerError, apiErr.NewErrorList(apiError))
+	}
 }
 
 type ImageManifest struct {

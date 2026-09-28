@@ -32,6 +32,8 @@ type CveInfo interface {
 
 type Scanner interface {
 	ScanImage(ctx context.Context, image string) (cvemodel.ScanResult, error)
+	// ScanRawReport returns the native Trivy report already serialized as JSON.
+	ScanRawReport(ctx context.Context, image string) (cvemodel.RawScanResult, error)
 	IsImageFormatScannable(repo, ref string) (bool, error)
 	IsImageMediaScannable(repo, digestStr, mediaType string) (bool, error)
 	// IsResultCached reports whether scan work for digest in repo is already covered by

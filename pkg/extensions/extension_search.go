@@ -3,6 +3,7 @@
 package extensions
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/vektah/gqlparser/v2/ast"
 
+	zerr "zotregistry.dev/zot/v2/errors"
 	"zotregistry.dev/zot/v2/pkg/api/config"
 	"zotregistry.dev/zot/v2/pkg/api/constants"
 	zcommon "zotregistry.dev/zot/v2/pkg/common"
@@ -50,6 +52,19 @@ const (
 )
 
 type CveScanner cveinfo.Scanner
+
+func ScanRawReport(ctx context.Context, cveScanner CveScanner, image string) ([]byte, error) {
+	if cveScanner == nil {
+		return nil, zerr.ErrCVESearchDisabled
+	}
+
+	result, err := cveScanner.ScanRawReport(ctx, image)
+	if err != nil {
+		return nil, err
+	}
+
+	return result.ReportJSON, nil
+}
 
 func IsBuiltWithSearchExtension() bool {
 	return true

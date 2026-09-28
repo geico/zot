@@ -690,6 +690,15 @@ func DistSpecAuthzHandler(ctlr *Controller) mux.MiddlewareFunc {
 			resource := vars["name"]
 			reference, ok := vars["reference"]
 
+			if isRawVulnerabilitiesRequest(request) {
+				// the reference lives in a query parameter here; reject malformed requests outright
+				// rather than letting them through unauthorized.
+				reference, ok = rawVulnerabilityReference(response, request, resource)
+				if !ok {
+					return
+				}
+			}
+
 			acCtrlr := NewAccessController(ctlr.Config)
 
 			// get userAc built in authn and previous authz middlewares

@@ -986,6 +986,51 @@ paths:
           schema:
             type: string
       summary: List image tags
+  /v2/{name}/vulnerabilities:
+    get:
+      consumes:
+      - application/json
+      description: Get the complete, unmodified Trivy report for an image, given a
+        tag or a digest
+      parameters:
+      - description: repository name
+        in: path
+        name: name
+        required: true
+        type: string
+      - description: image tag or manifest digest
+        in: query
+        name: ref
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: ok
+          schema:
+            type: string
+        "400":
+          description: bad request
+          schema:
+            type: string
+        "404":
+          description: not found
+          schema:
+            type: string
+        "415":
+          description: unsupported media type
+          schema:
+            type: string
+        "500":
+          description: internal server error
+          schema:
+            type: string
+        "501":
+          description: not implemented
+          schema:
+            type: string
+      summary: Get the native Trivy vulnerability report
   /zot/auth/apikey:
     delete:
       consumes:
