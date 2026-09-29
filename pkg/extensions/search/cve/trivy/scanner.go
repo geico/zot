@@ -50,6 +50,10 @@ import (
 
 const cacheSize = 1000000
 
+// defaultRawReportCacheBytes budgets the raw Trivy report cache by size rather than entry count,
+// since a single report ranges from kilobytes to tens of megabytes.
+const defaultRawReportCacheBytes = 256 << 20
+
 const (
 	defaultSBOMFormat         = types.FormatSPDXJSON
 	defaultSBOMArtifactType   = "application/spdx+json"
@@ -80,6 +84,9 @@ func initTrivyLogger(logger log.Logger) {
 }
 
 var errImageStoreNotFound = errors.New("image store not found")
+
+var errRawReportRequiresManifest = fmt.Errorf("%w: raw Trivy report requires a platform-specific image manifest",
+	zerr.ErrScanNotSupported)
 
 var newArtifactRunner = artifact.NewRunner //nolint:gochecknoglobals // test seam for deterministic runner injection
 
@@ -163,6 +170,7 @@ type Scanner struct {
 	log                 log.Logger
 	dbLock              *sync.Mutex
 	cache               *cvecache.CveCache
+	rawReportCache      *cvecache.RawReportCache
 	dbRepositoryRef     name.Reference
 	javaDBRepositoryRef name.Reference
 	vulnSeveritySources []dbTypes.SourceID
@@ -278,6 +286,7 @@ func NewScanner(storeController storage.StoreController,
 		storeController:       storeController,
 		dbLock:                &sync.Mutex{},
 		cache:                 cvecache.NewCveCache(cacheSize, log),
+		rawReportCache:        cvecache.NewRawReportCache(defaultRawReportCacheBytes),
 		dbRepositoryRef:       dbRepositoryRef,
 		javaDBRepositoryRef:   javaDBRepositoryRef,
 		vulnSeveritySources:   sevSources,
@@ -774,6 +783,140 @@ func (scanner Scanner) ScanImage(ctx context.Context, image string) (cvemodel.Sc
 	}, nil
 }
 
+// ScanRawReport returns the native Trivy report as JSON. It is serialized here so the cache can
+// be bounded by size and so cache hits need no further encoding.
+func (scanner Scanner) ScanRawReport(ctx context.Context, image string) (cvemodel.RawScanResult, error) {
+	repo, digest, mediaType, err := scanner.resolveRawReportTarget(ctx, image)
+	if err != nil {
+		return cvemodel.RawScanResult{}, err
+	}
+
+	if compat.IsImageIndexMediaType(mediaType) {
+		return cvemodel.RawScanResult{}, fmt.Errorf("%w: %q", errRawReportRequiresManifest, mediaType)
+	}
+	if !compat.IsImageManifestMediaType(mediaType) {
+		return cvemodel.RawScanResult{}, fmt.Errorf("%w: unsupported image media type %q",
+			zerr.ErrScanNotSupported, mediaType)
+	}
+
+	scannable, err := scanner.IsImageMediaScannable(repo, digest, mediaType)
+	if err != nil {
+		return cvemodel.RawScanResult{}, err
+	}
+	if !scannable {
+		return cvemodel.RawScanResult{}, zerr.ErrScanNotSupported
+	}
+
+	result, err := scanner.scanRawManifest(ctx, repo, digest)
+	if err != nil {
+		return cvemodel.RawScanResult{}, err
+	}
+
+	result.Digest = digest
+	result.MediaType = mediaType
+
+	return result, nil
+}
+
+func (scanner Scanner) resolveRawReportTarget(ctx context.Context, image string) (string, string, string, error) {
+	repo, ref, isTag := zcommon.GetImageDirAndReference(image)
+	digest := ref
+	mediaType := ""
+
+	if isTag {
+		imageDescriptor, err := getImageDescriptor(ctx, scanner.metaDB, repo, ref)
+		if err != nil {
+			return "", "", "", err
+		}
+
+		digest = imageDescriptor.Digest
+		mediaType = imageDescriptor.MediaType
+	} else {
+		found := false
+		found, mediaType = findMediaTypeForDigest(scanner.metaDB, godigest.Digest(ref))
+		if !found {
+			return "", "", "", zerr.ErrManifestNotFound
+		}
+	}
+
+	return repo, digest, mediaType, nil
+}
+
+func (scanner Scanner) scanRawManifest(ctx context.Context, repo, digest string) (cvemodel.RawScanResult, error) {
+	if reportJSON, ok := scanner.getCachedRawReport(repo, digest); ok {
+		return cvemodel.RawScanResult{
+			ReportJSON: reportJSON,
+			CVEMap:     scanner.cache.Get(digest),
+			WasCached:  true,
+		}, nil
+	}
+
+	resultChan := scanner.scanSingleFlightGroup.DoChan(manifestScanKey(repo, digest), func() (any, error) {
+		return scanner.scanManifestUncached(ctx, repo, digest, true)
+	})
+
+	select {
+	case result := <-resultChan:
+		if result.Err != nil {
+			return cvemodel.RawScanResult{}, result.Err
+		}
+
+		scanResult, ok := result.Val.(cacheableScanResult)
+		if !ok {
+			return cvemodel.RawScanResult{}, errors.New("unexpected result from shared manifest scan")
+		}
+
+		return scanner.rawResultFrom(ctx, repo, digest, scanResult)
+	case <-ctx.Done():
+		return cvemodel.RawScanResult{}, ctx.Err()
+	}
+}
+
+// rawResultFrom supplies the serialized report when this caller joined a flight started by the
+// CVE path, which does not produce one.
+func (scanner Scanner) rawResultFrom(ctx context.Context, repo, digest string, scanResult cacheableScanResult,
+) (cvemodel.RawScanResult, error) {
+	if scanResult.reportJSON == nil {
+		if scanResult.wasCached {
+			// that flight reused a cached CVE map, so there is no report to serialize
+			fresh, err := scanner.scanManifestUncached(ctx, repo, digest, true)
+			if err != nil {
+				return cvemodel.RawScanResult{}, err
+			}
+
+			scanResult = fresh
+		} else {
+			reportJSON, err := json.Marshal(scanResult.report)
+			if err != nil {
+				return cvemodel.RawScanResult{}, err
+			}
+
+			scanner.addCachedRawReport(repo, digest, reportJSON)
+			scanResult.reportJSON = reportJSON
+		}
+	}
+
+	return cvemodel.RawScanResult{
+		ReportJSON: scanResult.reportJSON,
+		CVEMap:     scanResult.cachedMap,
+		WasCached:  scanResult.wasCached,
+	}, nil
+}
+
+func (scanner Scanner) getCachedRawReport(repo, digest string) ([]byte, bool) {
+	if scanner.rawReportCache == nil {
+		return nil, false
+	}
+
+	return scanner.rawReportCache.Get(manifestScanKey(repo, digest))
+}
+
+func (scanner Scanner) addCachedRawReport(repo, digest string, report []byte) {
+	if scanner.rawReportCache != nil {
+		scanner.rawReportCache.Add(manifestScanKey(repo, digest), report)
+	}
+}
+
 func (scanner Scanner) scanManifest(ctx context.Context, repo, digest string) (map[string]zcommon.CVE, bool, error) {
 	if cachedMap := scanner.cache.Get(digest); cachedMap != nil {
 		return cachedMap, true, nil
@@ -783,8 +926,8 @@ func (scanner Scanner) scanManifest(ctx context.Context, repo, digest string) (m
 	// stop waiting on its own ctx without canceling the shared scan for the other callers.
 	// The key includes repo since the same digest can be scanned concurrently through
 	// different repos, each resolving to its own store config and SBOM persistence target.
-	resultChan := scanner.scanSingleFlightGroup.DoChan(repo+"@"+digest, func() (any, error) {
-		return scanner.scanManifestUncached(ctx, repo, digest)
+	resultChan := scanner.scanSingleFlightGroup.DoChan(manifestScanKey(repo, digest), func() (any, error) {
+		return scanner.scanManifestUncached(ctx, repo, digest, false)
 	})
 
 	select {
@@ -807,16 +950,22 @@ func (scanner Scanner) scanManifest(ctx context.Context, repo, digest string) (m
 // scanManifestUncached scans a single manifest digest, or returns the cached result if one
 // appeared while this call was queued behind the flight group. It is only ever invoked once
 // per digest at a time, via scanSingleFlightGroup, so it is safe to test in isolation.
-func (scanner Scanner) scanManifestUncached(ctx context.Context, repo, digest string) (cacheableScanResult, error) {
-	// Double check the cache under flight group lock to prevent a race
-	// where a caller just sees a cache miss before the cache is updated.
-	// In this case, the caller initiates a fresh flight even though a scan just finished up.
-	// This avoids a double scan of the image.
+func (scanner Scanner) scanManifestUncached(ctx context.Context, repo, digest string, wantRaw bool,
+) (cacheableScanResult, error) {
+	// A CVE-only caller is satisfied by the cached map alone; a raw caller also needs the report,
+	// so it falls through to a scan when only the map is cached.
 	if cachedMap := scanner.cache.Get(digest); cachedMap != nil {
-		return cacheableScanResult{cachedMap, true}, nil
+		if !wantRaw {
+			return cacheableScanResult{cachedMap: cachedMap, wasCached: true}, nil
+		}
+
+		if reportJSON, ok := scanner.getCachedRawReport(repo, digest); ok {
+			return cacheableScanResult{reportJSON: reportJSON, cachedMap: cachedMap, wasCached: true}, nil
+		}
 	}
 
 	cveidMap := map[string]zcommon.CVE{}
+	// the path Trivy scans, relative to the store root; not a cache key
 	image := repo + "@" + digest
 
 	// Use separate context without cancellation for scanning
@@ -833,83 +982,93 @@ func (scanner Scanner) scanManifestUncached(ctx context.Context, repo, digest st
 		return cacheableScanResult{}, err
 	}
 
+	stripScanPath(&report, opts.ScanOptions.Target, image)
+
 	// SBOM persistence is best-effort: CVE scanning should still complete even if
 	// SBOM artifact upload fails.
 	if err = scanner.storeSBOMAsOCIArtifact(scanCtx, repo, digest, sbom); err != nil {
 		scanner.log.Warn().Err(err).Str("image", image).Msg("failed to store generated sbom as OCI artifact")
 	}
 
+	cveidMap = cveMapFromReport(report)
+
+	scanner.cache.Add(digest, cveidMap)
+
+	result := cacheableScanResult{report: report, cachedMap: cveidMap, wasCached: false}
+
+	// only the raw path pays to serialize and retain the report
+	if wantRaw {
+		reportJSON, err := json.Marshal(report)
+		if err != nil {
+			return cacheableScanResult{}, err
+		}
+
+		scanner.addCachedRawReport(repo, digest, reportJSON)
+		result.reportJSON = reportJSON
+	}
+
+	return result, nil
+}
+
+// stripScanPath replaces the on-disk location Trivy scanned with the image reference, so the
+// report does not disclose the server's storage layout.
+func stripScanPath(report *types.Report, scanPath, image string) {
+	report.ArtifactName = strings.Replace(report.ArtifactName, scanPath, image, 1)
+
+	for idx := range report.Results {
+		report.Results[idx].Target = strings.Replace(report.Results[idx].Target, scanPath, image, 1)
+	}
+}
+
+func cveMapFromReport(report types.Report) map[string]zcommon.CVE {
+	cveMap := map[string]zcommon.CVE{}
+
 	for _, result := range report.Results {
 		for _, vulnerability := range result.Vulnerabilities {
-			pkgName := vulnerability.PkgName
-
-			installedVersion := vulnerability.InstalledVersion
-
-			var fixedVersion string
-			if vulnerability.FixedVersion != "" {
-				fixedVersion = vulnerability.FixedVersion
-			} else {
+			fixedVersion := vulnerability.FixedVersion
+			if fixedVersion == "" {
 				fixedVersion = cvemodel.NotSpecified
 			}
 
-			var packagePath string
-			if vulnerability.PkgPath != "" {
-				packagePath = vulnerability.PkgPath
-			} else {
+			packagePath := vulnerability.PkgPath
+			if packagePath == "" {
 				packagePath = cvemodel.NotSpecified
 			}
 
-			_, ok := cveidMap[vulnerability.VulnerabilityID]
-			if ok {
-				cveDetailStruct := cveidMap[vulnerability.VulnerabilityID]
+			cve, found := cveMap[vulnerability.VulnerabilityID]
+			if found {
+				cve.PackageList = append(cve.PackageList, zcommon.Package{
+					Name:             vulnerability.PkgName,
+					PackagePath:      packagePath,
+					InstalledVersion: vulnerability.InstalledVersion,
+					FixedVersion:     fixedVersion,
+				})
+				cveMap[vulnerability.VulnerabilityID] = cve
 
-				pkgList := cveDetailStruct.PackageList
+				continue
+			}
 
-				pkgList = append(
-					pkgList,
-					zcommon.Package{
-						Name:             pkgName,
-						PackagePath:      packagePath,
-						InstalledVersion: installedVersion,
-						FixedVersion:     fixedVersion,
-					},
-				)
-
-				cveDetailStruct.PackageList = pkgList
-
-				cveidMap[vulnerability.VulnerabilityID] = cveDetailStruct
-			} else {
-				newPkgList := make([]zcommon.Package, 0)
-
-				newPkgList = append(
-					newPkgList,
-					zcommon.Package{
-						Name:             pkgName,
-						PackagePath:      packagePath,
-						InstalledVersion: installedVersion,
-						FixedVersion:     fixedVersion,
-					},
-				)
-
-				cveidMap[vulnerability.VulnerabilityID] = zcommon.CVE{
-					ID:          vulnerability.VulnerabilityID,
-					Title:       vulnerability.Title,
-					Description: vulnerability.Description,
-					Reference: getCVEReference(
-						vulnerability.VulnerabilityID,
-						vulnerability.PrimaryURL,
-						vulnerability.References,
-					),
-					Severity:    convertSeverity(vulnerability.Severity),
-					PackageList: newPkgList,
-				}
+			cveMap[vulnerability.VulnerabilityID] = zcommon.CVE{
+				ID:          vulnerability.VulnerabilityID,
+				Title:       vulnerability.Title,
+				Description: vulnerability.Description,
+				Reference: getCVEReference(
+					vulnerability.VulnerabilityID,
+					vulnerability.PrimaryURL,
+					vulnerability.References,
+				),
+				Severity: convertSeverity(vulnerability.Severity),
+				PackageList: []zcommon.Package{{
+					Name:             vulnerability.PkgName,
+					PackagePath:      packagePath,
+					InstalledVersion: vulnerability.InstalledVersion,
+					FixedVersion:     fixedVersion,
+				}},
 			}
 		}
 	}
 
-	scanner.cache.Add(digest, cveidMap)
-
-	return cacheableScanResult{cveidMap, false}, nil
+	return cveMap
 }
 
 func (scanner Scanner) storeSBOMAsOCIArtifact(ctx context.Context,
@@ -1095,8 +1254,18 @@ func getNVDReference(references []string) (string, bool) {
 }
 
 type cacheableScanResult struct {
-	cachedMap map[string]zcommon.CVE
-	wasCached bool
+	// report is set only when this flight actually ran Trivy, so a raw caller that joined a
+	// CVE-initiated flight can serialize it instead of scanning again.
+	report     types.Report
+	reportJSON []byte
+	cachedMap  map[string]zcommon.CVE
+	wasCached  bool
+}
+
+// manifestScanKey scopes a manifest scan to the repo it was requested through. A Trivy report
+// records the repo path it was scanned from, so it must not be shared across repos.
+func manifestScanKey(repo, digest string) string {
+	return repo + "@" + digest
 }
 
 func (scanner Scanner) scanIndex(ctx context.Context, repo, digest string) (map[string]zcommon.CVE, bool, error) {
@@ -1121,7 +1290,7 @@ func (scanner Scanner) scanIndex(ctx context.Context, repo, digest string) (map[
 			return cacheableScanResult{}, err
 		}
 
-		return cacheableScanResult{cveIDMap, wasCached}, nil
+		return cacheableScanResult{cachedMap: cveIDMap, wasCached: wasCached}, nil
 	})
 
 	select {
@@ -1267,6 +1436,9 @@ func (scanner Scanner) UpdateDB(ctx context.Context) error {
 	}
 
 	scanner.cache.Purge()
+	if scanner.rawReportCache != nil {
+		scanner.rawReportCache.Purge()
+	}
 
 	return nil
 }

@@ -690,6 +690,23 @@ func DistSpecAuthzHandler(ctlr *Controller) mux.MiddlewareFunc {
 			resource := vars["name"]
 			reference, ok := vars["reference"]
 
+			if isRawVulnerabilitiesRequest(request) {
+				// the reference lives in a query parameter here; reject malformed requests outright
+				// rather than letting them through unauthorized.
+				refs := request.URL.Query()["ref"]
+				if len(refs) != 1 || !isValidRawVulnerabilityReference(refs[0]) {
+					apiError := apiErr.NewError(apiErr.MANIFEST_INVALID).AddDetail(map[string]string{
+						"name":   resource,
+						"reason": "exactly one valid tag or digest ref query parameter is required",
+					})
+					common.WriteJSON(response, http.StatusBadRequest, apiErr.NewErrorList(apiError))
+
+					return
+				}
+
+				reference, ok = refs[0], true
+			}
+
 			acCtrlr := NewAccessController(ctlr.Config)
 
 			// get userAc built in authn and previous authz middlewares

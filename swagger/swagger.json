@@ -1090,6 +1090,72 @@
                 }
             }
         },
+        "/v2/{name}/vulnerabilities": {
+            "get": {
+                "description": "Get the complete, unmodified Trivy report for an image, given a tag or a digest",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "summary": "Get the native Trivy vulnerability report",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "repository name",
+                        "name": "name",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "image tag or manifest digest",
+                        "name": "ref",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "ok",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "400": {
+                        "description": "bad request",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "404": {
+                        "description": "not found",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "415": {
+                        "description": "unsupported media type",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "internal server error",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "501": {
+                        "description": "not implemented",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
         "/zot/auth/apikey": {
             "get": {
                 "description": "Get list of all API keys for a logged in user",

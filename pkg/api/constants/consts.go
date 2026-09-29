@@ -8,6 +8,9 @@ const (
 	Uploads              = "uploads"
 	DistAPIVersion       = "Docker-Distribution-API-Version"
 	DistContentDigestKey = "Docker-Content-Digest"
+	// RawVulnerabilitiesRouteName identifies the raw Trivy report route to the authz middleware,
+	// which cannot rely on the URL path because {name} may contain slashes.
+	RawVulnerabilitiesRouteName = "raw-vulnerabilities"
 	// OCITagResponseKey is returned on digest manifest pushes that include tag query
 	// parameters (distribution-spec PR #600).
 	OCITagResponseKey = "OCI-Tag"

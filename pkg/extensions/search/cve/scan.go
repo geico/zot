@@ -266,6 +266,19 @@ func (s *scanner) ScanImage(ctx context.Context, image string) (cvemodel.ScanRes
 	return result, err
 }
 
+// ScanRawReport is decorated alongside ScanImage because a raw report request performs a real
+// scan, and it populates the shared CVE cache; without this the later ScanImage would report
+// WasCached and the ImageScanned event would never be emitted for that digest.
+func (s *scanner) ScanRawReport(ctx context.Context, image string) (cvemodel.RawScanResult, error) {
+	result, err := s.Scanner.ScanRawReport(ctx, image)
+	if err == nil && s.eventRecorder != nil && !result.WasCached {
+		repo, ref, _ := zcommon.GetImageDirAndReference(image)
+		s.publishScanEvent(ctx, repo, ref, result.Digest, result.MediaType, result.CVEMap)
+	}
+
+	return result, err
+}
+
 // publishScanEvent emits one ImageScanned event for the given repo/ref/digest/mediaType.
 func (s *scanner) publishScanEvent(ctx context.Context, repo, ref, digest, mediaType string,
 	cveMap map[string]zcommon.CVE,

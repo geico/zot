@@ -81,6 +81,7 @@ type CveScannerMock struct {
 	IsResultCachedFn         func(repo, digest string) bool
 	GetCachedResultFn        func(repo, digest string) map[string]zcommon.CVE
 	ScanImageFn              func(ctx context.Context, image string) (cvemodel.ScanResult, error)
+	ScanRawReportFn          func(ctx context.Context, image string) (cvemodel.RawScanResult, error)
 	UpdateDBFn               func(ctx context.Context) error
 }
 
@@ -124,6 +125,14 @@ func (scanner CveScannerMock) ScanImage(ctx context.Context, image string) (cvem
 	return cvemodel.ScanResult{CVEMap: map[string]zcommon.CVE{}}, nil
 }
 
+func (scanner CveScannerMock) ScanRawReport(ctx context.Context, image string) (cvemodel.RawScanResult, error) {
+	if scanner.ScanRawReportFn != nil {
+		return scanner.ScanRawReportFn(ctx, image)
+	}
+
+	return cvemodel.RawScanResult{ReportJSON: []byte("{}")}, nil
+}
+
 func (scanner CveScannerMock) UpdateDB(ctx context.Context) error {
 	if scanner.UpdateDBFn != nil {
 		return scanner.UpdateDBFn(ctx)
@@ -158,6 +167,10 @@ func (scanner *TestCveScanner) ScanImage(ctx context.Context, image string) (cve
 	}
 
 	return cvemodel.ScanResult{CVEMap: map[string]zcommon.CVE{}}, nil
+}
+
+func (scanner *TestCveScanner) ScanRawReport(ctx context.Context, image string) (cvemodel.RawScanResult, error) {
+	return cvemodel.RawScanResult{ReportJSON: []byte("{}")}, nil
 }
 
 func (scanner *TestCveScanner) IsImageFormatScannable(repo string, reference string) (bool, error) {

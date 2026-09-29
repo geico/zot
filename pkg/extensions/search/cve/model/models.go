@@ -97,3 +97,14 @@ type ScanResult struct {
 	MediaType string
 	WasCached bool
 }
+
+// RawScanResult is the outcome of a Scanner.ScanRawReport call. It mirrors ScanResult but carries
+// the native Trivy report already serialized, so callers never decode it. The CVE map and cache
+// flag come along because a raw scan is a real scan: decorators need them to report it as one.
+type RawScanResult struct {
+	ReportJSON []byte
+	CVEMap     map[string]zcommon.CVE
+	Digest     string
+	MediaType  string
+	WasCached  bool
+}
