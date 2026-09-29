@@ -2534,7 +2534,9 @@ func TestRawReportCacheIsScopedPerRepo(t *testing.T) {
 		t.Fatalf("cached report mismatch: got %s want %s", cachedA.ReportJSON, reportA.ReportJSON)
 	}
 
-	if got := calls.Get(artifactA); got != 1 {
+	// the report no longer carries the on-disk path, so count scans by the path Trivy was handed.
+	scanPathA := path.Join(scanner.storeController.DefaultStore.RootDir(), "repo-a@"+image.DigestStr())
+	if got := calls.Get(scanPathA); got != 1 {
 		t.Fatalf("expected repo-a to be scanned once, got %d", got)
 	}
 }
@@ -2609,6 +2611,46 @@ func artifactNameFromJSON(t *testing.T, reportJSON []byte) string {
 	}
 
 	return report.ArtifactName
+}
+
+func TestRawReportDoesNotLeakStoragePath(t *testing.T) {
+	scanner, image := newRawReportScanner(t)
+
+	stubTrivyScan(t, func(_ context.Context, opts flag.Options) (trivyTypes.Report, error) {
+		// Trivy echoes the on-disk target back, and decorates the per-result target.
+		return trivyTypes.Report{
+			SchemaVersion: 2,
+			ArtifactName:  opts.Target,
+			Results:       trivyTypes.Results{{Target: opts.Target + " (centos 7.9.2009)"}},
+		}, nil
+	})
+
+	imageRef := "repo@" + image.DigestStr()
+
+	result, err := scanner.ScanRawReport(context.Background(), imageRef)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	rootDir := scanner.storeController.DefaultStore.RootDir()
+	if bytes.Contains(result.ReportJSON, []byte(rootDir)) {
+		t.Fatalf("report leaks the storage path %q: %s", rootDir, result.ReportJSON)
+	}
+
+	var report trivyTypes.Report
+	if err := json.Unmarshal(result.ReportJSON, &report); err != nil {
+		t.Fatalf("cannot decode report: %v", err)
+	}
+
+	if report.ArtifactName != imageRef {
+		t.Fatalf("expected ArtifactName %q, got %q", imageRef, report.ArtifactName)
+	}
+
+	// the suffix Trivy appends must survive; only the path prefix is rewritten.
+	wantTarget := imageRef + " (centos 7.9.2009)"
+	if len(report.Results) != 1 || report.Results[0].Target != wantTarget {
+		t.Fatalf("expected result target %q, got %+v", wantTarget, report.Results)
+	}
 }
 
 // A tag and the digest it resolves to must converge on a single scan and a single cached report.

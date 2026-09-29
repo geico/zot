@@ -985,6 +985,8 @@ func (scanner Scanner) scanManifestUncached(ctx context.Context, repo, digest st
 		return cacheableScanResult{}, err
 	}
 
+	stripScanPath(&report, opts.ScanOptions.Target, image)
+
 	// SBOM persistence is best-effort: CVE scanning should still complete even if
 	// SBOM artifact upload fails.
 	if err = scanner.storeSBOMAsOCIArtifact(scanCtx, repo, digest, sbom); err != nil {
@@ -1009,6 +1011,16 @@ func (scanner Scanner) scanManifestUncached(ctx context.Context, repo, digest st
 	}
 
 	return result, nil
+}
+
+// stripScanPath replaces the on-disk location Trivy scanned with the image reference, so the
+// report does not disclose the server's storage layout.
+func stripScanPath(report *types.Report, scanPath, image string) {
+	report.ArtifactName = strings.Replace(report.ArtifactName, scanPath, image, 1)
+
+	for idx := range report.Results {
+		report.Results[idx].Target = strings.Replace(report.Results[idx].Target, scanPath, image, 1)
+	}
 }
 
 func cveMapFromReport(report types.Report) map[string]zcommon.CVE {
