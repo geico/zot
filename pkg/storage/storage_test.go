@@ -32,6 +32,7 @@ import (
 	zerr "zotregistry.dev/zot/v2/errors"
 	"zotregistry.dev/zot/v2/pkg/api/config"
 	rediscfg "zotregistry.dev/zot/v2/pkg/api/config/redis"
+	zcommon "zotregistry.dev/zot/v2/pkg/common"
 	"zotregistry.dev/zot/v2/pkg/compat"
 	"zotregistry.dev/zot/v2/pkg/extensions/events"
 	"zotregistry.dev/zot/v2/pkg/extensions/monitoring"
@@ -2657,7 +2658,7 @@ func TestReuploadCorruptedBlob(t *testing.T) {
 				ok, size, err = imgStore.CheckBlob(context.Background(), repoName, blobDigest)
 				So(ok, ShouldBeFalse)
 				So(size, ShouldNotEqual, blobSize)
-				So(err, ShouldEqual, zerr.ErrBlobNotFound)
+				So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeTrue)
 
 				err = WriteImageToFileSystem(image, repoName, tag, storeController)
 				So(err, ShouldBeNil)
@@ -2699,7 +2700,7 @@ func TestReuploadCorruptedBlob(t *testing.T) {
 				ok, size, err = imgStore.CheckBlob(context.Background(), repoName, blobDigest)
 				So(ok, ShouldBeFalse)
 				So(size, ShouldNotEqual, blobSize)
-				So(err, ShouldEqual, zerr.ErrBlobNotFound)
+				So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeTrue)
 
 				err = WriteMultiArchImageToFileSystem(image, repoName, tag, storeController)
 				So(err, ShouldBeNil)
@@ -2875,6 +2876,113 @@ func TestReuploadEqualSizeCorruptedManifestWithDedupe(t *testing.T) {
 		So(storeDriver.SameFile(manifestPathA, manifestPathB), ShouldBeTrue)
 		So(imgStore.VerifyBlobDigestValue(repoA, manifestDigest), ShouldBeNil)
 		So(imgStore.VerifyBlobDigestValue(repoB, manifestDigest), ShouldBeNil)
+	})
+}
+
+func TestReuploadManifestRepairsRemoteDedupeOrigin(t *testing.T) {
+	Convey("Remote dedupe manifest re-upload repairs the cache origin", t, func() {
+		const (
+			repoA = "remote-manifest-dedupe-a"
+			repoB = "remote-manifest-dedupe-b"
+			repoC = "remote-manifest-dedupe-c"
+		)
+
+		cases := []struct {
+			name         string
+			deleteOrigin bool
+			deleteCache  bool
+		}{
+			{name: "equal-size corrupted origin"},
+			{name: "missing origin", deleteOrigin: true},
+			{name: "missing cache", deleteCache: true},
+		}
+
+		for _, testCase := range cases {
+			Convey(testCase.name, func() {
+				rootDir := t.TempDir()
+				log := zlog.NewTestLogger()
+				storeDriver := &remoteMarkerDriver{Driver: local.New(true)}
+
+				cacheDriver, err := storage.Create("boltdb", cache.BoltDBDriverParameters{
+					RootDir:     rootDir,
+					Name:        "cache",
+					UseRelPaths: true,
+				}, log)
+				So(err, ShouldBeNil)
+
+				imgStore := imagestore.NewImageStore(rootDir, rootDir, true, true, log,
+					monitoring.NewNopMetricServer(), nil, storeDriver, cacheDriver, nil, nil)
+				storeController := storage.StoreController{DefaultStore: imgStore}
+				image := CreateRandomImage()
+				image.Manifest.Annotations = map[string]string{"probe": "good"}
+
+				for _, repo := range []string{repoA, repoB, repoC} {
+					So(WriteImageToFileSystem(image, repo, "1.0", storeController), ShouldBeNil)
+				}
+
+				manifestBody, manifestDigest, mediaType, err := imgStore.GetImageManifest(repoA, "1.0")
+				So(err, ShouldBeNil)
+
+				manifestPaths := []string{
+					imgStore.BlobPath(repoA, manifestDigest),
+					imgStore.BlobPath(repoB, manifestDigest),
+					imgStore.BlobPath(repoC, manifestDigest),
+				}
+				So(imgStore.RunDedupeForDigest(context.Background(), manifestDigest, true, manifestPaths), ShouldBeNil)
+
+				cachedOrigin, err := cacheDriver.GetBlob(manifestDigest)
+				So(err, ShouldBeNil)
+				So(path.Clean(path.Join(rootDir, cachedOrigin)), ShouldEqual, path.Clean(manifestPaths[0]))
+
+				switch {
+				case testCase.deleteCache:
+					for _, manifestPath := range manifestPaths {
+						So(cacheDriver.DeleteBlob(manifestDigest, manifestPath), ShouldBeNil)
+					}
+				case testCase.deleteOrigin:
+					So(storeDriver.Delete(manifestPaths[0]), ShouldBeNil)
+				default:
+					corruptedBody := bytes.Replace(manifestBody, []byte("good"), []byte("baad"), 1)
+					So(corruptedBody, ShouldNotResemble, manifestBody)
+					So(len(corruptedBody), ShouldEqual, len(manifestBody))
+					_, err = storeDriver.WriteFile(manifestPaths[0], corruptedBody)
+					So(err, ShouldBeNil)
+				}
+
+				_, _, err = imgStore.PutImageManifest(context.Background(), repoB, "1.0", mediaType, manifestBody, nil)
+
+				if testCase.deleteCache {
+					So(errors.Is(err, zerr.ErrManifestCacheLookup), ShouldBeTrue)
+					So(errors.Is(err, zerr.ErrCacheMiss), ShouldBeTrue)
+					storedBody, readErr := storeDriver.ReadFile(manifestPaths[1])
+					So(readErr, ShouldBeNil)
+					So(storedBody, ShouldBeEmpty)
+
+					return
+				}
+
+				So(err, ShouldBeNil)
+				storedOrigin, err := storeDriver.ReadFile(manifestPaths[0])
+				So(err, ShouldBeNil)
+				So(storedOrigin, ShouldResemble, manifestBody)
+
+				for _, manifestPath := range manifestPaths[1:] {
+					blobInfo, statErr := storeDriver.Stat(manifestPath)
+					So(statErr, ShouldBeNil)
+					So(blobInfo.Size(), ShouldEqual, 0)
+				}
+
+				cachedOrigin, err = cacheDriver.GetBlob(manifestDigest)
+				So(err, ShouldBeNil)
+				So(path.Clean(path.Join(rootDir, cachedOrigin)), ShouldEqual, path.Clean(manifestPaths[0]))
+
+				for _, repo := range []string{repoA, repoB, repoC} {
+					storedBody, _, _, readErr := imgStore.GetImageManifest(repo, "1.0")
+					So(readErr, ShouldBeNil)
+					So(storedBody, ShouldResemble, manifestBody)
+				}
+			})
+		}
 	})
 }
 
@@ -4894,6 +5002,22 @@ func DumpKeys(t *testing.T, redisURL string) {
 	}
 }
 
+// remoteMarkerDriver models object-storage dedupe: Link creates a zero-byte object
+// instead of a filesystem hard link, while all other operations use local storage.
+type remoteMarkerDriver struct {
+	*local.Driver
+}
+
+func (d *remoteMarkerDriver) Name() string {
+	return storageConstants.S3StorageDriverName
+}
+
+func (d *remoteMarkerDriver) Link(_, dest string) error {
+	_, err := d.Driver.WriteFile(dest, nil)
+
+	return err
+}
+
 // stagingHookDriver wraps the local driver so staged-write tests can inject WriteFile / Move failures.
 type stagingHookDriver struct {
 	*local.Driver
@@ -5186,5 +5310,182 @@ func TestCheckBlobEmptyBlob(t *testing.T) {
 	ok, size, err = imgStore.CheckBlob(ctx, repo, nonEmptyDigest)
 	assertExpectation(ok, ShouldBeFalse)
 	assertExpectation(size, ShouldEqual, int64(-1))
-	assertExpectation(err, ShouldEqual, zerr.ErrBlobNotFound)
+	if !errors.Is(err, zerr.ErrBlobNotFound) {
+		t.Fatalf("expected ErrBlobNotFound, got %v", err)
+	}
+}
+
+func TestCheckIsImageSignature(t *testing.T) {
+	Convey("CheckIsImageSignature tells signatures from attestations and other referrers", t, func() {
+		image := CreateRandomImage()
+		subject := image.DescriptorRef()
+
+		check := func(manifest Image, reference string) (bool, string, godigest.Digest) {
+			isSignature, signatureType, signedDigest, err := storage.CheckIsImageSignature("repo",
+				manifest.ManifestDescriptor.Data, reference)
+			So(err, ShouldBeNil)
+
+			return isSignature, signatureType, signedDigest
+		}
+
+		Convey("a notation signature", func() {
+			signature := CreateMockNotationSignature(subject)
+
+			isSignature, signatureType, signedDigest := check(signature, signature.DigestStr())
+			So(isSignature, ShouldBeTrue)
+			So(signatureType, ShouldEqual, storage.NotationType)
+			So(signedDigest, ShouldEqual, image.Digest())
+		})
+
+		Convey("a legacy cosign signature referrer", func() {
+			signature := CreateMockCosignSignature(subject)
+
+			isSignature, signatureType, signedDigest := check(signature, signature.DigestStr())
+			So(isSignature, ShouldBeTrue)
+			So(signatureType, ShouldEqual, storage.CosignType)
+			So(signedDigest, ShouldEqual, image.Digest())
+		})
+
+		Convey("a cosign sign bundle, with and without the predicate type annotation", func() {
+			for _, signature := range []Image{
+				CreateMockCosignBundleSignature(subject),
+				CreateMockCosignBundleAttestation(subject, zcommon.CosignSignPredicateType),
+			} {
+				isSignature, signatureType, signedDigest := check(signature, signature.DigestStr())
+				So(isSignature, ShouldBeTrue)
+				So(signatureType, ShouldEqual, storage.CosignType)
+				So(signedDigest, ShouldEqual, image.Digest())
+			}
+		})
+
+		Convey("a cosign attest bundle is not a signature", func() {
+			attestation := CreateMockCosignBundleAttestation(subject, "https://spdx.dev/Document")
+
+			isSignature, signatureType, signedDigest := check(attestation, attestation.DigestStr())
+			So(isSignature, ShouldBeFalse)
+			So(signatureType, ShouldBeEmpty)
+			So(signedDigest, ShouldBeEmpty)
+		})
+
+		Convey("a legacy cosign signature tag", func() {
+			signature := CreateRandomImage()
+			tag := fmt.Sprintf("sha256-%s.sig", image.Digest().Encoded())
+
+			isSignature, signatureType, signedDigest := check(signature, tag)
+			So(isSignature, ShouldBeTrue)
+			So(signatureType, ShouldEqual, storage.CosignType)
+			So(signedDigest, ShouldEqual, image.Digest())
+		})
+
+		Convey("an image is not a signature", func() {
+			isSignature, signatureType, signedDigest := check(image, "latest")
+			So(isSignature, ShouldBeFalse)
+			So(signatureType, ShouldBeEmpty)
+			So(signedDigest, ShouldBeEmpty)
+		})
+
+		Convey("a manifest that does not parse", func() {
+			_, _, _, err := storage.CheckIsImageSignature("repo", []byte("not a manifest"), "latest")
+			So(err, ShouldNotBeNil)
+		})
+	})
+}
+
+// TestCloudRemoteCacheDedupePreservesLateOrigin reproduces the issue-4463 setup:
+// remote object store + redis cache + dedupe, late-sorting repo holds the origin,
+// early-sorting repo is a stub; a startup-style dedupe walk must not empty the origin.
+func TestCloudRemoteCacheDedupePreservesLateOrigin(t *testing.T) {
+	cases := []struct {
+		name        string
+		storageType string
+	}{
+		{name: "S3_Redis", storageType: storageConstants.S3StorageDriverName},
+		{name: "Azure_Redis", storageType: storageConstants.AzureStorageDriverName},
+	}
+
+	for _, testcase := range cases {
+		t.Run(testcase.name, func(t *testing.T) {
+			switch testcase.storageType {
+			case storageConstants.S3StorageDriverName:
+				tskip.SkipS3(t)
+			case storageConstants.AzureStorageDriverName:
+				tskip.SkipAzure(t)
+			}
+
+			miniRedis := miniredis.RunT(t)
+			redisAddr := "redis://" + miniRedis.Addr()
+			defer DumpKeys(t, redisAddr)
+
+			uuid, err := guuid.NewV4()
+			if err != nil {
+				panic(err)
+			}
+
+			testDir := path.Join("/oci-repo-test", uuid.String())
+			cacheDir := t.TempDir()
+
+			opts := createObjectStoreOpts{
+				rootDir:       testDir,
+				cacheDir:      cacheDir,
+				cacheType:     storageConstants.RedisDriverName,
+				storageType:   testcase.storageType,
+				miniRedisAddr: redisAddr,
+			}
+
+			store, imgStore, _, err := createObjectsStore(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			cleanupRoot := testDir
+			if testcase.storageType == storageConstants.AzureStorageDriverName {
+				cleanupRoot = "/"
+			}
+			defer cleanupStorage(store, cleanupRoot)
+
+			Convey("push late origin then early stub, rebuild without emptying origin", t, func() {
+				ctx := context.Background()
+				content := []byte("shared-layer-content-for-dedupe-origin-preserve")
+				digest := godigest.FromBytes(content)
+
+				// Late-sorting repo first so redis records it as the origin.
+				_, _, err := imgStore.FullBlobUpload(ctx, "b/img", bytes.NewReader(content), digest)
+				So(err, ShouldBeNil)
+
+				// Early-sorting repo second: stored as a 0-byte remote Link stub.
+				_, _, err = imgStore.FullBlobUpload(ctx, "a/img", bytes.NewReader(content), digest)
+				So(err, ShouldBeNil)
+
+				originPath := imgStore.BlobPath("b/img", digest)
+				stubPath := imgStore.BlobPath("a/img", digest)
+
+				originInfo, err := store.Stat(originPath)
+				So(err, ShouldBeNil)
+				So(originInfo.Size(), ShouldBeGreaterThan, 0)
+
+				stubInfo, err := store.Stat(stubPath)
+				So(err, ShouldBeNil)
+				So(stubInfo.Size(), ShouldEqual, 0)
+
+				// Restart-style: new ImageStore, same remote objects + same redis cache.
+				_, imgStore2, _, err := createObjectsStore(opts)
+				So(err, ShouldBeNil)
+
+				err = imgStore2.RunDedupeForDigest(ctx, digest, true, []string{stubPath, originPath})
+				So(err, ShouldBeNil)
+
+				originInfo, err = store.Stat(originPath)
+				So(err, ShouldBeNil)
+				So(originInfo.Size(), ShouldEqual, int64(len(content)))
+
+				got, err := imgStore2.GetBlobContent("b/img", digest)
+				So(err, ShouldBeNil)
+				So(got, ShouldResemble, content)
+
+				got, err = imgStore2.GetBlobContent("a/img", digest)
+				So(err, ShouldBeNil)
+				So(got, ShouldResemble, content)
+			})
+		})
+	}
 }

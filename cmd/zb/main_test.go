@@ -2,6 +2,7 @@ package main //nolint:testpackage // separate binary
 
 import (
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -20,6 +21,7 @@ var (
 	errIOTimeout         = errors.New("i/o timeout")
 	errDeadlineExceeded  = errors.New("context deadline exceeded")
 	errClosedConn        = errors.New("write tcp: use of closed network connection")
+	errUnexpectedEOFMsg  = errors.New("unexpected EOF")
 	errUnexpectedStatus  = errors.New("unexpected status")
 	errConnectionRefused = errors.New("connection refused")
 )
@@ -143,7 +145,58 @@ func TestIsTimeoutError(t *testing.T) {
 		So(isTimeoutError(errIOTimeout), ShouldBeTrue)
 		So(isTimeoutError(errDeadlineExceeded), ShouldBeTrue)
 		So(isTimeoutError(errClosedConn), ShouldBeTrue)
+		So(isTimeoutError(errUnexpectedEOFMsg), ShouldBeTrue)
+		So(isTimeoutError(io.ErrUnexpectedEOF), ShouldBeTrue)
 		So(isTimeoutError(&timeoutNetError{}), ShouldBeTrue)
+	})
+}
+
+func TestRetryOnTimeoutError(t *testing.T) {
+	Convey("succeeds without retry", t, func() {
+		attempts := 0
+		err := retryOnTimeoutError(0, func() error {
+			attempts++
+
+			return nil
+		})
+		So(err, ShouldBeNil)
+		So(attempts, ShouldEqual, 1)
+	})
+
+	Convey("retries timeout-class errors then succeeds", t, func() {
+		attempts := 0
+		err := retryOnTimeoutError(0, func() error {
+			attempts++
+			if attempts < maxSeedPushAttempts {
+				return errClosedConn
+			}
+
+			return nil
+		})
+		So(err, ShouldBeNil)
+		So(attempts, ShouldEqual, maxSeedPushAttempts)
+	})
+
+	Convey("returns the last timeout error after exhausting attempts", t, func() {
+		attempts := 0
+		err := retryOnTimeoutError(0, func() error {
+			attempts++
+
+			return errIOTimeout
+		})
+		So(err, ShouldEqual, errIOTimeout)
+		So(attempts, ShouldEqual, maxSeedPushAttempts)
+	})
+
+	Convey("does not retry non-timeout errors", t, func() {
+		attempts := 0
+		err := retryOnTimeoutError(0, func() error {
+			attempts++
+
+			return errSomethingElse
+		})
+		So(err, ShouldEqual, errSomethingElse)
+		So(attempts, ShouldEqual, 1)
 	})
 }
 

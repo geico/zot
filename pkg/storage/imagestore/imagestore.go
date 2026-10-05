@@ -33,6 +33,7 @@ import (
 	"zotregistry.dev/zot/v2/pkg/scheduler"
 	common "zotregistry.dev/zot/v2/pkg/storage/common"
 	storageConstants "zotregistry.dev/zot/v2/pkg/storage/constants"
+	"zotregistry.dev/zot/v2/pkg/storage/errclass"
 	storageTypes "zotregistry.dev/zot/v2/pkg/storage/types"
 	"zotregistry.dev/zot/v2/pkg/test/inject"
 )
@@ -248,7 +249,15 @@ func (is *ImageStore) ValidateRepo(name string) (bool, error) {
 	if err != nil {
 		is.log.Error().Err(err).Str("dir", dir).Msg("failed to read directory")
 
-		return false, zerr.ErrRepoNotFound
+		if errclass.IsStorageObjectMissing(err) {
+			return false, errclass.Wrap(zerr.ErrRepoNotFound, err)
+		}
+
+		if errors.Is(err, zerr.ErrStorageTransient) || errors.Is(err, zerr.ErrStoragePermanent) {
+			return false, err
+		}
+
+		return false, errclass.MarkTransient(err)
 	}
 
 	//nolint:mnd
@@ -339,10 +348,22 @@ func (is *ImageStore) GetNextRepositories(lastRepo string, maxEntries int, filte
 			return driver.ErrSkipDir
 		}
 
-		if !ok || err != nil {
+		if err != nil {
+			// Per-path List/Validate outages: keep a partial catalog rather than
+			// failing the whole Walk. Transient/Permanent are logged; Missing and
+			// other cases stay quiet (same as !ok below).
+			if errors.Is(err, zerr.ErrStorageTransient) || errors.Is(err, zerr.ErrStoragePermanent) {
+				is.log.Warn().Err(err).Str("repository", rel).
+					Msg("skipping repository candidate after storage failure during validate")
+			}
+
+			return nil //nolint:nilerr
+		}
+
+		if !ok {
 			// Not an OCI layout yet, but the name is valid — keep walking children
 			// so nested repos (path "org" → "org/team") are still discovered.
-			return nil //nolint:nilerr
+			return nil
 		}
 
 		if lastRepo == rel {
@@ -372,7 +393,7 @@ func (is *ImageStore) GetNextRepositories(lastRepo string, maxEntries int, filte
 
 	driverErr := &driver.Error{}
 
-	if errors.As(err, &driver.PathNotFoundError{}) {
+	if errclass.IsStorageObjectMissing(err) {
 		is.log.Debug().Msg("empty rootDir")
 
 		return stores, false, nil
@@ -423,10 +444,22 @@ func (is *ImageStore) GetRepositories() ([]string, error) {
 			return driver.ErrSkipDir
 		}
 
-		if !ok || err != nil {
+		if err != nil {
+			// Per-path List/Validate outages: keep a partial catalog rather than
+			// failing the whole Walk. Transient/Permanent are logged; Missing and
+			// other cases stay quiet (same as !ok below).
+			if errors.Is(err, zerr.ErrStorageTransient) || errors.Is(err, zerr.ErrStoragePermanent) {
+				is.log.Warn().Err(err).Str("repository", rel).
+					Msg("skipping repository candidate after storage failure during validate")
+			}
+
+			return nil //nolint:nilerr
+		}
+
+		if !ok {
 			// Not an OCI layout yet, but the name is valid — keep walking children
 			// so nested repos (path "org" → "org/team") are still discovered.
-			return nil //nolint:nilerr
+			return nil
 		}
 
 		stores = append(stores, rel)
@@ -435,7 +468,7 @@ func (is *ImageStore) GetRepositories() ([]string, error) {
 	})
 
 	// if the root directory is not yet created then return an empty slice of repositories
-	if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
+	if errclass.IsStorageObjectMissing(err) {
 		return stores, nil
 	}
 
@@ -453,7 +486,7 @@ func (is *ImageStore) GetNextRepository(processedRepos map[string]struct{}) (str
 
 	_, err := is.storeDriver.List(dir)
 	if err != nil {
-		if errors.As(err, &driver.PathNotFoundError{}) {
+		if errclass.IsStorageObjectMissing(err) {
 			is.log.Debug().Msg("empty rootDir")
 
 			return "", nil
@@ -495,10 +528,22 @@ func (is *ImageStore) GetNextRepository(processedRepos map[string]struct{}) (str
 			return driver.ErrSkipDir
 		}
 
-		if !ok || err != nil {
+		if err != nil {
+			// Per-path List/Validate outages: keep a partial catalog rather than
+			// failing the whole Walk. Transient/Permanent are logged; Missing and
+			// other cases stay quiet (same as !ok below).
+			if errors.Is(err, zerr.ErrStorageTransient) || errors.Is(err, zerr.ErrStoragePermanent) {
+				is.log.Warn().Err(err).Str("repository", rel).
+					Msg("skipping repository candidate after storage failure during validate")
+			}
+
+			return nil //nolint:nilerr
+		}
+
+		if !ok {
 			// Not an OCI layout yet, but the name is valid — keep walking children
 			// so nested repos (path "org" → "org/team") are still discovered.
-			return nil //nolint:nilerr
+			return nil
 		}
 
 		store = rel
@@ -510,7 +555,7 @@ func (is *ImageStore) GetNextRepository(processedRepos map[string]struct{}) (str
 
 	// some s3 implementations (eg, digitalocean spaces) will return pathnotfounderror for walk but not list
 	// therefore, we must also catch that error here.
-	if errors.As(err, &driver.PathNotFoundError{}) {
+	if errclass.IsStorageObjectMissing(err) {
 		is.log.Debug().Msg("empty rootDir")
 
 		return "", nil
@@ -528,9 +573,8 @@ func (is *ImageStore) GetNextRepository(processedRepos map[string]struct{}) (str
 func (is *ImageStore) GetImageTags(repo string) ([]string, error) {
 	var lockLatency time.Time
 
-	dir := path.Join(is.rootDir, repo)
-	if fi, err := is.storeDriver.Stat(dir); err != nil || !fi.IsDir() {
-		return nil, zerr.ErrRepoNotFound
+	if err := is.statRepoDir(repo); err != nil {
+		return nil, err
 	}
 
 	is.RLock(&lockLatency)
@@ -546,9 +590,8 @@ func (is *ImageStore) GetImageTags(repo string) ([]string, error) {
 
 // GetImageManifest returns the image manifest of an image in the specific repository.
 func (is *ImageStore) GetImageManifest(repo, reference string) ([]byte, godigest.Digest, string, error) {
-	dir := path.Join(is.rootDir, repo)
-	if fi, err := is.storeDriver.Stat(dir); err != nil || !fi.IsDir() {
-		return nil, "", "", zerr.ErrRepoNotFound
+	if err := is.statRepoDir(repo); err != nil {
+		return nil, "", "", err
 	}
 
 	var lockLatency time.Time
@@ -585,7 +628,7 @@ func (is *ImageStore) GetImageManifest(repo, reference string) ([]byte, godigest
 
 	var manifest ispec.Manifest
 	if err := json.Unmarshal(buf, &manifest); err != nil {
-		is.log.Error().Err(err).Str("dir", dir).Msg("invalid JSON")
+		is.log.Error().Err(err).Str("dir", path.Join(is.rootDir, repo)).Msg("invalid JSON")
 
 		return nil, "", "", err
 	}
@@ -695,7 +738,24 @@ func (is *ImageStore) PutImageManifest(ctx context.Context, repo, reference, med
 	dir := path.Join(is.rootDir, repo, ispec.ImageBlobsDir, mDigest.Algorithm().String())
 	manifestPath := path.Join(dir, mDigest.Encoded())
 
+	contentPath := manifestPath
 	binfo, statErr := is.storeDriver.Stat(manifestPath)
+	if statErr == nil && is.dedupe && is.storeDriver.Name() != storageConstants.LocalStorageDriverName &&
+		binfo.Size() == 0 && !isEmptyContentDigest(mDigest) {
+		contentPath, err = is.getCachedBlobPath(mDigest)
+		if err != nil {
+			err = fmt.Errorf("%w: %w", zerr.ErrManifestCacheLookup, err)
+			is.log.Error().Err(err).Str("file", manifestPath).Str("digest", mDigest.String()).
+				Msg("failed to resolve dedupe origin for manifest")
+
+			return "", "", err
+		}
+
+		// Keep the cache record intact when the origin object is missing: the
+		// re-upload below can recreate the object at the same backing path.
+		binfo, statErr = is.storeDriver.Stat(contentPath)
+	}
+
 	needsWrite := statErr != nil
 	if !needsWrite {
 		needsWrite = binfo.Size() != desc.Size
@@ -705,13 +765,13 @@ func (is *ImageStore) PutImageManifest(ctx context.Context, repo, reference, med
 		// body is already digest-validated; compare to on-disk bytes instead of
 		// re-hashing (manifests are small / API-capped at MaxManifestBodySize).
 		// Hashing would add compute overhead.
-		stored, readErr := is.storeDriver.ReadFile(manifestPath)
+		stored, readErr := is.storeDriver.ReadFile(contentPath)
 		if readErr != nil || !slices.Equal(stored, body) {
 			if readErr != nil {
-				is.log.Warn().Err(readErr).Str("file", manifestPath).
+				is.log.Warn().Err(readErr).Str("file", contentPath).
 					Msg("failed to read existing manifest; rewriting")
 			} else {
-				is.log.Warn().Str("file", manifestPath).
+				is.log.Warn().Str("file", contentPath).
 					Msg("manifest blob content mismatch; rewriting")
 			}
 
@@ -722,17 +782,17 @@ func (is *ImageStore) PutImageManifest(ctx context.Context, repo, reference, med
 	if needsWrite {
 		// Prefer in-place write for digest blobs so hard-linked dedupe siblings
 		// share the repaired inode (local Driver.WriteFile truncates in place).
-		nbytes, writeErr := is.storeDriver.WriteFile(manifestPath, body)
+		nbytes, writeErr := is.storeDriver.WriteFile(contentPath, body)
 		if writeErr != nil {
 			err = writeErr
-			is.log.Error().Err(err).Str("file", manifestPath).Msg("failed to write")
+			is.log.Error().Err(err).Str("file", contentPath).Msg("failed to write")
 
 			return "", "", err
 		}
 
 		if nbytes != len(body) {
 			err = io.ErrShortWrite
-			is.log.Error().Err(err).Str("file", manifestPath).Msg("failed to write manifest: short write")
+			is.log.Error().Err(err).Str("file", contentPath).Msg("failed to write manifest: short write")
 
 			return "", "", err
 		}
@@ -876,9 +936,8 @@ func (is *ImageStore) PutImageManifest(ctx context.Context, repo, reference, med
 
 // DeleteImageManifest deletes the image manifest from the repository.
 func (is *ImageStore) DeleteImageManifest(ctx context.Context, repo, reference string, detectCollisions bool) error {
-	dir := path.Join(is.rootDir, repo)
-	if fi, err := is.storeDriver.Stat(dir); err != nil || !fi.IsDir() {
-		return zerr.ErrRepoNotFound
+	if err := is.statRepoDir(repo); err != nil {
+		return err
 	}
 
 	var lockLatency time.Time
@@ -995,7 +1054,7 @@ ListBlobUploads returns all blob uploads present in the repository. The caller f
 func (is *ImageStore) ListBlobUploads(repo string) ([]string, error) {
 	blobUploadPaths, err := is.storeDriver.List(path.Join(is.RootDir(), repo, storageConstants.BlobUploadDir))
 	if err != nil {
-		if errors.As(err, &driver.PathNotFoundError{}) {
+		if errclass.IsStorageObjectMissing(err) {
 			// blobs uploads folder does not exist
 			return []string{}, nil
 		}
@@ -1047,7 +1106,11 @@ func (is *ImageStore) NewBlobUpload(ctx context.Context, repo string) (string, e
 	if err != nil {
 		is.log.Debug().Err(err).Str("blob", blobUploadPath).Msg("failed to start multipart writer")
 
-		return "", zerr.ErrRepoNotFound
+		if errclass.IsStorageObjectMissing(err) {
+			return "", zerr.ErrRepoNotFound
+		}
+
+		return "", err
 	}
 
 	defer writer.Close()
@@ -1067,7 +1130,7 @@ func (is *ImageStore) GetBlobUpload(repo, uuid string) (int64, error) {
 
 	writer, err := is.storeDriver.Writer(blobUploadPath, true)
 	if err != nil {
-		if errors.As(err, &driver.PathNotFoundError{}) {
+		if errclass.IsStorageObjectMissing(err) {
 			return -1, zerr.ErrUploadNotFound
 		}
 
@@ -1107,7 +1170,7 @@ func (is *ImageStore) openBlobUploadWriter(ctx context.Context, repo, uuid strin
 
 	file, err := is.storeDriver.Writer(is.BlobUploadPath(repo, uuid), true)
 	if err != nil {
-		if errors.As(err, &driver.PathNotFoundError{}) {
+		if errclass.IsStorageObjectMissing(err) {
 			return nil, zerr.ErrUploadNotFound
 		}
 
@@ -1134,9 +1197,11 @@ func (is *ImageStore) PutBlobChunkStreamed(ctx context.Context, repo, uuid strin
 		err = file.Close()
 	}()
 
+	fsize := file.Size()
+
 	n, err = io.Copy(file, body)
 
-	return n, err
+	return n + fsize, err
 }
 
 // PutBlobChunk writes another chunk of data to the specified blob. It returns
@@ -1172,7 +1237,7 @@ func (is *ImageStore) BlobUploadInfo(repo, uuid string) (int64, error) {
 
 	writer, err := is.storeDriver.Writer(blobUploadPath, true)
 	if err != nil {
-		if errors.As(err, &driver.PathNotFoundError{}) {
+		if errclass.IsStorageObjectMissing(err) {
 			return -1, zerr.ErrUploadNotFound
 		}
 
@@ -1197,7 +1262,11 @@ func (is *ImageStore) FinishBlobUpload(repo, uuid string, body io.Reader, dstDig
 	if err != nil {
 		is.log.Error().Err(err).Str("blob", src).Msg("failed to open blob")
 
-		return zerr.ErrUploadNotFound
+		if errclass.IsStorageObjectMissing(err) {
+			return zerr.ErrUploadNotFound
+		}
+
+		return err
 	}
 
 	if err := fileWriter.Commit(context.Background()); err != nil {
@@ -1300,7 +1369,11 @@ func (is *ImageStore) FullBlobUpload(ctx context.Context, repo string, body io.R
 	if err != nil {
 		is.log.Error().Err(err).Str("blob", src).Msg("failed to open blob")
 
-		return "", -1, zerr.ErrUploadNotFound
+		if errclass.IsStorageObjectMissing(err) {
+			return "", -1, zerr.ErrUploadNotFound
+		}
+
+		return "", -1, err
 	}
 
 	mw := io.MultiWriter(blobFile, digester)
@@ -1389,20 +1462,26 @@ func (is *ImageStore) DedupeBlob(src string, dstDigest godigest.Digest, dstRepo 
 		}
 
 		if dstRecord == "" {
-			// cache record doesn't exist, so first disk and cache entry for this digest
-			if err := is.cache.PutBlob(dstDigest, dst); err != nil {
-				is.log.Error().Err(err).Str("blobPath", dst).Str("component", "dedupe").
-					Msg("failed to insert blob record")
-
-				return err
-			}
-
-			// move the blob from uploads to final dest
+			// Move onto disk first, then publish the cache origin. Putting the
+			// cache entry before Move lets other cluster nodes (shared Redis /
+			// DynamoDB cache, per-process store locks only) observe an origin
+			// path that does not exist yet, Stat-fail, and race on DeleteBlob.
 			if err := is.storeDriver.Move(src, dst); err != nil {
 				is.log.Error().Err(err).Str("src", src).Str("dst", dst).Str("component", "dedupe").
 					Msg("failed to rename blob")
 
 				return err
+			}
+
+			if err := is.cache.PutBlob(dstDigest, dst); err != nil {
+				// Blob content is already durable at dst; failing the upload would
+				// return HTTP 500 while the object exists and the upload session is
+				// gone. Log and succeed — a later PutBlob or dedupe rebuild can
+				// publish the origin.
+				is.log.Error().Err(err).Str("blobPath", dst).Str("component", "dedupe").
+					Msg("failed to insert blob record after move; leaving blob committed")
+
+				return nil
 			}
 
 			is.log.Debug().Str("src", src).Str("dst", dst).Str("component", "dedupe").Msg("rename")
@@ -1422,7 +1501,15 @@ func (is *ImageStore) DedupeBlob(src string, dstDigest godigest.Digest, dstRepo 
 			// the actual blob on disk may have been removed by GC, so sync the cache
 			err := is.cache.DeleteBlob(dstDigest, dstRecord)
 			if err = inject.Error(err); err != nil {
-				//nolint:lll
+				// Another node may have already cleared the stale origin (common
+				// with Redis DeleteBlob under concurrent healers). Retry as miss.
+				if errors.Is(err, zerr.ErrCacheMiss) {
+					is.log.Debug().Err(err).Str("dstDigest", dstDigest.String()).Str("dst", dst).
+						Str("component", "dedupe").Msg("blob record already removed")
+
+					continue
+				}
+
 				is.log.Error().Err(err).Str("dstDigest", dstDigest.String()).Str("dst", dst).
 					Str("component", "dedupe").Msg("failed to delete blob record")
 
@@ -1486,7 +1573,7 @@ func (is *ImageStore) DeleteBlobUpload(repo, uuid string) error {
 
 	writer, err := is.storeDriver.Writer(blobUploadPath, true)
 	if err != nil {
-		if errors.As(err, &driver.PathNotFoundError{}) {
+		if errclass.IsStorageObjectMissing(err) {
 			return zerr.ErrUploadNotFound
 		}
 
@@ -1576,20 +1663,32 @@ func (is *ImageStore) CheckBlob(ctx context.Context, repo string, digest godiges
 
 	binfo, err := is.storeDriver.Stat(blobPath)
 	if err != nil {
+		// Only fall back to the cache when Stat classified Missing. Transient/
+		// Permanent must not trigger copyBlob/Link (remote Link writes an empty
+		// stub and can overwrite a live blob after a flaky Stat).
+		if !errclass.IsStorageObjectMissing(err) {
+			return false, -1, mapStorageErr(err)
+		}
+
+		statErr := err
+
 		dstRecord, err := is.checkCacheBlob(digest)
 		if err != nil {
-			if errors.Is(err, zerr.ErrCacheMiss) || errors.Is(err, zerr.ErrBlobNotFound) {
+			if errclass.IsBlobUnavailable(err) {
 				is.log.Debug().Err(err).Str("digest", digest.String()).Msg("cache miss for blob")
-			} else {
-				is.log.Warn().Err(err).Str("digest", digest.String()).Msg("failed to lookup blob in cache")
+
+				// Stat was Missing; cache also unavailable → BlobNotFound-shaped miss.
+				return false, -1, mapStorageErr(statErr)
 			}
 
-			return false, -1, zerr.ErrBlobNotFound
+			is.log.Warn().Err(err).Str("digest", digest.String()).Msg("failed to lookup blob in cache")
+
+			return false, -1, mapStorageErr(err)
 		}
 
 		blobSize, err := is.copyBlob(ctx, repo, blobPath, dstRecord)
 		if err != nil {
-			return false, -1, zerr.ErrBlobNotFound
+			return false, -1, mapStorageErr(err)
 		}
 
 		if blobSize == 0 && !isEmptyContentDigest(digest) {
@@ -1603,7 +1702,7 @@ func (is *ImageStore) CheckBlob(ctx context.Context, repo string, digest godiges
 		if err := is.cache.PutBlob(digest, blobPath); err != nil {
 			is.log.Error().Err(err).Str("blobPath", blobPath).Str("component", "dedupe").Msg("failed to insert blob record")
 
-			return false, -1, err
+			return false, -1, mapStorageErr(err)
 		}
 
 		return true, blobSize, nil
@@ -1640,18 +1739,18 @@ func (is *ImageStore) CheckBlob(ctx context.Context, repo string, digest godiges
 	dstRecord, err := is.checkCacheBlob(digest)
 	if err != nil {
 		// Cache miss / not-found is a normal condition when the blob truly doesn't exist.
-		if errors.Is(err, zerr.ErrCacheMiss) || errors.Is(err, zerr.ErrBlobNotFound) {
+		if errclass.IsBlobUnavailable(err) {
 			is.log.Debug().Err(err).Str("digest", digest.String()).Msg("cache miss for blob")
 		} else {
 			is.log.Warn().Err(err).Str("digest", digest.String()).Msg("failed to lookup blob in cache")
 		}
 
-		return false, -1, zerr.ErrBlobNotFound
+		return false, -1, mapStorageErr(err)
 	}
 
 	blobSize, err := is.copyBlob(ctx, repo, blobPath, dstRecord)
 	if err != nil {
-		return false, -1, zerr.ErrBlobNotFound
+		return false, -1, mapStorageErr(err)
 	}
 
 	// Fail closed whether or not dedupe is enabled: never treat a zero-size
@@ -1668,7 +1767,7 @@ func (is *ImageStore) CheckBlob(ctx context.Context, repo string, digest godiges
 	if err := is.cache.PutBlob(digest, blobPath); err != nil {
 		is.log.Error().Err(err).Str("blobPath", blobPath).Str("component", "dedupe").Msg("failed to insert blob record")
 
-		return false, -1, err
+		return false, -1, mapStorageErr(err)
 	}
 
 	return true, blobSize, nil
@@ -1693,23 +1792,21 @@ func (is *ImageStore) checkCacheBlob(digest godigest.Digest) (string, error) {
 		return "", err
 	}
 
-	if fmt.Sprintf("%v", is.cache) == fmt.Sprintf("%v", nil) {
-		return "", zerr.ErrBlobNotFound
-	}
-
-	dstRecord, err := is.cache.GetBlob(digest)
+	dstRecord, err := is.getCachedBlobPath(digest)
 	if err != nil {
 		return "", err
-	}
-
-	if is.cache.UsesRelativePaths() {
-		dstRecord = path.Join(is.rootDir, dstRecord)
 	}
 
 	if _, err := is.storeDriver.Stat(dstRecord); err != nil {
 		is.log.Error().Err(err).Str("blob", dstRecord).Msg("failed to stat blob")
 
-		// the actual blob on disk may have been removed by GC, so sync the cache
+		// Only sync the cache when the blob is actually gone. A transient Stat
+		// failure must not DeleteBlob (which can promote a stub on Redis) or be
+		// reported as a miss that rebuild then "repairs" with another path.
+		if !errclass.IsStorageObjectMissing(err) {
+			return "", mapStorageErr(err)
+		}
+
 		if err := is.cache.DeleteBlob(digest, dstRecord); err != nil {
 			is.log.Error().Err(err).Str("digest", digest.String()).Str("blobPath", dstRecord).
 				Msg("failed to remove blob path from cache")
@@ -1717,11 +1814,32 @@ func (is *ImageStore) checkCacheBlob(digest godigest.Digest) (string, error) {
 			return "", err
 		}
 
-		return "", zerr.ErrBlobNotFound
+		return "", mapStorageErr(err)
 	}
 
 	is.log.Debug().Str("digest", digest.String()).Str("dstRecord", dstRecord).Str("component", "cache").
 		Msg("found dedupe record")
+
+	return dstRecord, nil
+}
+
+func (is *ImageStore) getCachedBlobPath(digest godigest.Digest) (string, error) {
+	if fmt.Sprintf("%v", is.cache) == fmt.Sprintf("%v", nil) {
+		// No cache configured — not a cache-index miss.
+		return "", zerr.ErrBlobNotFound
+	}
+
+	dstRecord, err := is.cache.GetBlob(digest)
+	if err != nil {
+		return "", err
+	}
+	if dstRecord == "" {
+		return "", zerr.ErrBlobNotFound
+	}
+
+	if is.cache.UsesRelativePaths() {
+		dstRecord = path.Join(is.rootDir, dstRecord)
+	}
 
 	return dstRecord, nil
 }
@@ -1735,11 +1853,16 @@ func (is *ImageStore) copyBlob(ctx context.Context, repo string, blobPath, dstRe
 
 	_ = is.storeDriver.EnsureDir(filepath.Dir(blobPath))
 
-	if err := is.storeDriver.Link(dstRecord, blobPath); err != nil {
-		is.log.Error().Err(err).Str("blobPath", blobPath).Str("link", dstRecord).Str("component", "dedupe").
-			Msg("failed to hard link")
+	// Remote Link is PutContent of empty bytes to dest. Skip cleaned-equivalent
+	// paths here; drivers' Link implementations own exact/self and SameFile guards
+	// so we do not pay an extra remote Stat via SameFile on every placeholder copy.
+	if path.Clean(dstRecord) != path.Clean(blobPath) {
+		if err := is.storeDriver.Link(dstRecord, blobPath); err != nil {
+			is.log.Error().Err(err).Str("blobPath", blobPath).Str("link", dstRecord).Str("component", "dedupe").
+				Msg("failed to hard link")
 
-		return -1, zerr.ErrBlobNotFound
+			return -1, mapStorageErr(err)
+		}
 	}
 
 	// return original blob with content instead of the deduped one (blobPath)
@@ -1748,7 +1871,7 @@ func (is *ImageStore) copyBlob(ctx context.Context, repo string, blobPath, dstRe
 		return binfo.Size(), nil
 	}
 
-	return -1, zerr.ErrBlobNotFound
+	return -1, mapStorageErr(err)
 }
 
 // GetBlobPartial returns a partial stream to read the blob.
@@ -1779,7 +1902,7 @@ func (is *ImageStore) GetBlobPartial(repo string, digest godigest.Digest, mediaT
 	if err != nil {
 		is.log.Error().Err(err).Str("blob", binfo.Path()).Msg("failed to open blob")
 
-		return nil, -1, -1, err
+		return nil, -1, -1, mapStorageErr(err)
 	}
 
 	blobReadCloser, err := newBlobStream(blobHandle, from, end)
@@ -1799,19 +1922,23 @@ func (is *ImageStore) GetBlobPartial(repo string, digest godigest.Digest, mediaT
 
 On the storage, original blobs are those with contents, and duplicates one are just empty files.
 This function helps handling this situation, by using this one you can make sure you always get the original blob.
+
+Unlike CheckBlob, a failed Stat here does not fall back to the cache: Transient
+Stat must not be masked by a cache miss. Cache resolution runs only for size-0
+stubs (S3-style placeholders); full content blobs are expected at blobPath.
 */
 func (is *ImageStore) originalBlobInfo(repo string, digest godigest.Digest) (driver.FileInfo, error) {
 	blobPath := is.BlobPath(repo, digest)
 
 	binfo, err := is.storeDriver.Stat(blobPath)
 	if err != nil {
-		if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
+		if errclass.IsStorageObjectMissing(err) {
 			is.log.Debug().Err(err).Str("blob", blobPath).Str("digest", digest.String()).Msg("blob not found")
 		} else {
 			is.log.Error().Err(err).Str("blob", blobPath).Msg("failed to stat blob")
 		}
 
-		return nil, zerr.ErrBlobNotFound
+		return nil, mapStorageErr(err)
 	}
 
 	if binfo.Size() == 0 {
@@ -1828,20 +1955,20 @@ func (is *ImageStore) originalBlobInfo(repo string, digest godigest.Digest) (dri
 		if err != nil {
 			is.log.Debug().Err(err).Str("digest", digest.String()).Msg("not found in cache")
 
-			return nil, zerr.ErrBlobNotFound
+			return nil, mapStorageErr(err)
 		}
 
 		binfo, err = is.storeDriver.Stat(dstRecord)
 		if err != nil {
 			is.log.Error().Err(err).Str("blob", dstRecord).Msg("failed to stat blob")
 
-			return nil, zerr.ErrBlobNotFound
+			return nil, mapStorageErr(err)
 		}
 
 		// Fail closed whether or not dedupe is enabled: a cache "origin" that is
 		// itself empty cannot be served for a non-empty digest (HTTP 200 with a
-		// body that does not match the digest). Prefer ErrBlobNotFound so clients
-		// can fall back instead of consuming a bogus empty body.
+		// body that does not match the digest). Prefer ErrBlobNotFound (not
+		// MarkMissing — storage found a path) so clients can fall back.
 		if binfo.Size() == 0 {
 			is.log.Debug().Str("digest", digest.String()).Str("blob", dstRecord).
 				Msg("dedupe origin is empty for non-empty digest")
@@ -1879,7 +2006,7 @@ func (is *ImageStore) GetBlob(repo string, digest godigest.Digest, mediaType str
 	if err != nil {
 		is.log.Error().Err(err).Str("blob", binfo.Path()).Msg("failed to open blob")
 
-		return nil, -1, err
+		return nil, -1, mapStorageErr(err)
 	}
 
 	// The caller function is responsible for calling Close()
@@ -1906,7 +2033,12 @@ func (is *ImageStore) GetBlobRedirectURL(r *http.Request, repo string, digest go
 		return "", err
 	}
 
-	return is.storeDriver.RedirectURL(r, binfo.Path())
+	redirectURL, err := is.storeDriver.RedirectURL(r, binfo.Path())
+	if err != nil {
+		return "", mapStorageErr(err)
+	}
+
+	return redirectURL, nil
 }
 
 // GetBlobContent returns blob contents, the caller function MUST lock from outside.
@@ -1925,7 +2057,7 @@ func (is *ImageStore) GetBlobContent(repo string, digest godigest.Digest) ([]byt
 	if err != nil {
 		is.log.Error().Err(err).Str("blob", binfo.Path()).Msg("failed to open blob")
 
-		return nil, err
+		return nil, mapStorageErr(err)
 	}
 
 	return blobBuf, nil
@@ -1944,7 +2076,7 @@ func (is *ImageStore) VerifyBlobDigestValue(repo string, digest godigest.Digest)
 
 	blobReadCloser, err := is.storeDriver.Reader(binfo.Path(), 0)
 	if err != nil {
-		return err
+		return mapStorageErr(err)
 	}
 
 	defer blobReadCloser.Close()
@@ -1979,10 +2111,10 @@ func (is *ImageStore) GetIndexContent(repo string) ([]byte, error) {
 
 	buf, err := is.storeDriver.ReadFile(path.Join(dir, ispec.ImageIndexFile))
 	if err != nil {
-		if errors.Is(err, driver.PathNotFoundError{}) {
+		if errclass.IsStorageObjectMissing(err) {
 			is.log.Error().Err(err).Str("dir", dir).Msg("failed to read index.json")
 
-			return []byte{}, zerr.ErrRepoNotFound
+			return []byte{}, errclass.Wrap(zerr.ErrRepoNotFound, err)
 		}
 
 		is.log.Error().Err(err).Str("dir", dir).Msg("failed to read index.json")
@@ -1998,7 +2130,7 @@ func (is *ImageStore) StatIndex(repo string) (bool, int64, time.Time, error) {
 
 	fileInfo, err := is.storeDriver.Stat(repoIndexPath)
 	if err != nil {
-		if errors.As(err, &driver.PathNotFoundError{}) {
+		if errclass.IsStorageObjectMissing(err) {
 			is.log.Error().Err(err).Str("indexFile", repoIndexPath).Msg("failed to stat index.json")
 
 			return false, 0, time.Time{}, zerr.ErrRepoNotFound
@@ -2243,13 +2375,13 @@ func (is *ImageStore) deleteBlobChecked(repo string, digest godigest.Digest, isR
 
 	binfo, err := is.storeDriver.Stat(blobPath)
 	if err != nil {
-		if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
-			return zerr.ErrBlobNotFound
+		if errclass.IsStorageObjectMissing(err) {
+			return mapStorageErr(err)
 		}
 
 		is.log.Error().Err(err).Str("blob", blobPath).Msg("failed to stat blob")
 
-		return err
+		return mapStorageErr(err)
 	}
 
 	// first check if this blob is not currently in use
@@ -2338,7 +2470,7 @@ func (is *ImageStore) deleteBlobChecked(repo string, digest godigest.Digest, isR
 	}
 
 	if err := is.storeDriver.Delete(blobPath); err != nil {
-		if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
+		if errclass.IsStorageObjectMissing(err) {
 			is.log.Warn().Str("repository", repo).Str("digest", digest.String()).
 				Str("blobPath", blobPath).Msg("blob already removed from storage, skipping")
 
@@ -2377,7 +2509,7 @@ func (is *ImageStore) GetAllBlobs(repo string) ([]godigest.Digest, error) {
 
 	algorithmPaths, err := is.storeDriver.List(blobsDir)
 	if err != nil {
-		if errors.As(err, &driver.PathNotFoundError{}) {
+		if errclass.IsStorageObjectMissing(err) {
 			is.log.Debug().Str("directory", blobsDir).Msg("empty blobs directory")
 
 			return ret, nil
@@ -2395,8 +2527,18 @@ func (is *ImageStore) GetAllBlobs(repo string) ([]godigest.Digest, error) {
 
 		digestPaths, err := is.storeDriver.List(algorithmPath)
 		if err != nil {
-			// algorithmPath was obtained by looking up under the blobs directory
-			// we are sure it already exists, so PathNotFoundError does not need to be checked
+			// Parent List already returned this algorithm directory. A nested miss is
+			// not an empty blob store: on remote backends (S3/GCS/Azure) an empty or
+			// concurrently emptied prefix often surfaces as PathNotFound/Missing; a
+			// local TOCTOU delete between the two Lists can too. GC treats GetAllBlobs
+			// Missing as empty inventory and would prune live index rows. Fail closed
+			// as Transient. Stringify the cause (no %w) so IsStorageObjectMissing does
+			// not still match and soft-empty.
+			if errclass.IsStorageObjectMissing(err) {
+				return []godigest.Digest{}, fmt.Errorf("%w: listing %s: %s",
+					zerr.ErrStorageTransient, algorithmPath, err.Error())
+			}
+
 			return []godigest.Digest{}, err
 		}
 
@@ -2506,20 +2648,22 @@ func (is *ImageStore) GetNextDigestWithBlobPaths(repos []string, lastDigests []g
 	})
 
 	// if the root directory is not yet created
-	if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
+	if errclass.IsStorageObjectMissing(err) {
 		return digest, duplicateBlobs, nil
 	}
 
 	return digest, duplicateBlobs, err
 }
 
-func (is *ImageStore) getOriginalBlobFromDisk(duplicateBlobs []string) (string, error) {
+func (is *ImageStore) getOriginalBlobFromDisk(digest godigest.Digest, duplicateBlobs []string) (string, error) {
+	allowEmpty := isEmptyContentDigest(digest)
+
 	for _, blobPath := range duplicateBlobs {
 		binfo, err := is.storeDriver.Stat(blobPath)
 		if err != nil {
 			// The paths come from a listing taken earlier in the run, so a blob may have
 			// been deleted since. Keep looking: another copy may still hold the content.
-			if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
+			if errclass.IsStorageObjectMissing(err) {
 				is.log.Debug().Str("path", blobPath).Str("component", "storage").
 					Msg("blob deleted since it was listed, skipping")
 
@@ -2528,10 +2672,10 @@ func (is *ImageStore) getOriginalBlobFromDisk(duplicateBlobs []string) (string, 
 
 			is.log.Error().Err(err).Str("path", blobPath).Str("component", "storage").Msg("failed to stat blob")
 
-			return "", zerr.ErrBlobNotFound
+			return "", mapStorageErr(err)
 		}
 
-		if binfo.Size() > 0 {
+		if binfo.Size() > 0 || (allowEmpty && binfo.Size() == 0) {
 			return blobPath, nil
 		}
 	}
@@ -2545,10 +2689,38 @@ func (is *ImageStore) getOriginalBlob(digest godigest.Digest, duplicateBlobs []s
 	var err error
 
 	originalBlob, err = is.checkCacheBlob(digest)
-	if err != nil && !errors.Is(err, zerr.ErrBlobNotFound) && !errors.Is(err, zerr.ErrCacheMiss) {
+	if err != nil && !errclass.IsBlobUnavailable(err) {
 		is.log.Error().Err(err).Str("component", "dedupe").Msg("failed to find blob in cache")
 
 		return originalBlob, err
+	}
+
+	// Remote Link stubs are empty placeholders. A stale cache entry that points at a
+	// stub must not be treated as the content-bearing original, or the walk would
+	// Link over real copies and empty them. Genuine empty digests are size 0 by
+	// definition and remain valid origins.
+	if originalBlob != "" {
+		binfo, serr := is.storeDriver.Stat(originalBlob)
+		if serr != nil {
+			// Only missing paths are safe to abandon: a transient Stat failure must not
+			// re-point the cache at another copy and later Link over the real origin.
+			if !errclass.IsStorageObjectMissing(serr) {
+				is.log.Error().Err(serr).Str("path", originalBlob).Str("component", "dedupe").
+					Msg("failed to stat cached original blob")
+
+				return "", serr
+			}
+
+			is.log.Warn().Err(serr).Str("path", originalBlob).Str("component", "dedupe").
+				Msg("cached original blob missing, searching storage")
+
+			originalBlob = ""
+		} else if binfo.Size() == 0 && !isEmptyContentDigest(digest) {
+			is.log.Warn().Str("path", originalBlob).Str("component", "dedupe").
+				Msg("cached original blob has no content, searching storage")
+
+			originalBlob = ""
+		}
 	}
 
 	// if we still don't have, search it
@@ -2557,8 +2729,16 @@ func (is *ImageStore) getOriginalBlob(digest godigest.Digest, duplicateBlobs []s
 		// a rebuild dedupe was attempted in the past
 		// get original blob, should be found otherwise exit with error
 
-		originalBlob, err = is.getOriginalBlobFromDisk(duplicateBlobs)
+		originalBlob, err = is.getOriginalBlobFromDisk(digest, duplicateBlobs)
 		if err != nil {
+			return originalBlob, err
+		}
+	}
+
+	// PutBlob never replaces an existing origin entry. After rejecting an empty stub
+	// (or recovering via disk search), point the cache at the validated content path.
+	if fmt.Sprintf("%v", is.cache) != fmt.Sprintf("%v", nil) {
+		if err := is.cache.SetOrigin(digest, originalBlob); err != nil {
 			return originalBlob, err
 		}
 	}
@@ -2591,7 +2771,7 @@ func (is *ImageStore) dedupeBlobs(ctx context.Context, digest godigest.Digest, d
 			blob may have been deleted since. Skipping keeps the run progressing: failing the
 			task instead leaves its completion callback unrun, so OnRunComplete never fires
 			and the restore marker or the deferred-delete gate stays stuck. */
-			if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
+			if errclass.IsStorageObjectMissing(err) {
 				is.log.Debug().Str("path", blobPath).Str("component", "dedupe").
 					Msg("blob deleted since it was listed, skipping")
 
@@ -2614,13 +2794,6 @@ func (is *ImageStore) dedupeBlobs(ctx context.Context, digest godigest.Digest, d
 
 					return zerr.ErrDedupeRebuild
 				}
-
-				// cache original blob
-				if _, err := is.cache.GetBlob(digest); err != nil {
-					if err := is.cache.PutBlob(digest, originalBlob); err != nil {
-						return err
-					}
-				}
 			}
 
 			// cache dedupe blob
@@ -2631,10 +2804,23 @@ func (is *ImageStore) dedupeBlobs(ctx context.Context, digest godigest.Digest, d
 			}
 		} else {
 			// if we have an original blob cached then we can safely dedupe the rest of them
-			if originalBlob != "" {
+			// Never Link a path onto itself: remote drivers implement Link as PutContent of
+			// empty bytes to dest, which would replace the only real copy with a stub.
+			if originalBlob != "" && path.Clean(originalBlob) != path.Clean(blobPath) {
 				if err := is.storeDriver.Link(originalBlob, blobPath); err != nil {
 					is.log.Error().Err(err).Str("path", blobPath).Str("component", "dedupe").Msg("failed to dedupe blob")
 
+					return err
+				}
+			} else if originalBlob == "" {
+				// First content-bearing path is the preserved origin. Do not reassign
+				// after linking a later full copy: that would point originalBlob at a
+				// path we just emptied and empty the real origin on the next iteration.
+				originalBlob = blobPath
+
+				// Repair even when no stub was seen first: PutBlob alone cannot replace
+				// a stale empty origin left in the cache.
+				if err := is.cache.SetOrigin(digest, originalBlob); err != nil {
 					return err
 				}
 			}
@@ -2645,9 +2831,6 @@ func (is *ImageStore) dedupeBlobs(ctx context.Context, digest godigest.Digest, d
 					return err
 				}
 			}
-
-			// mark blob as preserved
-			originalBlob = blobPath
 		}
 	}
 
@@ -2663,7 +2846,7 @@ func (is *ImageStore) dedupeBlobs(ctx context.Context, digest godigest.Digest, d
 func (is *ImageStore) anyBlobExists(blobPaths []string) bool {
 	for _, blobPath := range blobPaths {
 		if _, err := is.storeDriver.Stat(blobPath); err != nil {
-			if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
+			if errclass.IsStorageObjectMissing(err) {
 				continue
 			}
 		}
@@ -2709,7 +2892,7 @@ func (is *ImageStore) restoreDedupedBlobs(ctx context.Context, digest godigest.D
 			blob may have been deleted since. Skipping keeps the run progressing: failing the
 			task instead leaves its completion callback unrun, so OnRunComplete never fires
 			and the restore marker or the deferred-delete gate stays stuck. */
-			if _, ok := errors.AsType[driver.PathNotFoundError](err); ok {
+			if errclass.IsStorageObjectMissing(err) {
 				is.log.Debug().Str("path", blobPath).Str("component", "dedupe").
 					Msg("blob deleted since it was listed, skipping")
 
@@ -2753,7 +2936,7 @@ func (is *ImageStore) restoreDedupedBlobs(ctx context.Context, digest godigest.D
 						return nil
 					}
 				} else {
-					if _, ok := errors.AsType[driver.PathNotFoundError](serr); !ok {
+					if !errclass.IsStorageObjectMissing(serr) {
 						return serr
 					}
 				}
@@ -2802,7 +2985,7 @@ func (is *ImageStore) RunDedupeBlobs(interval time.Duration, sch *scheduler.Sche
 		// Dedupe is active: remove the restore-complete marker so that a future dedupe→false
 		// transition knows it must run restore again.
 		if err := is.storeDriver.Delete(markerPath); err != nil {
-			if _, ok := errors.AsType[driver.PathNotFoundError](err); !ok {
+			if !errclass.IsStorageObjectMissing(err) {
 				is.log.Warn().Err(err).Str("component", "dedupe").
 					Msg("failed to remove restore-complete marker")
 
@@ -2833,11 +3016,9 @@ func (is *ImageStore) RunDedupeBlobs(interval time.Duration, sch *scheduler.Sche
 
 			is.log.Debug().Str("component", "dedupe").Str("content", content).
 				Msg("restore-complete marker present but not complete, continuing with dedupe restore scan")
-		} else {
-			if _, ok := errors.AsType[driver.PathNotFoundError](err); !ok {
-				is.log.Warn().Err(err).Str("component", "dedupe").
-					Msg("failed to check restore-complete marker; continuing with dedupe restore scan")
-			}
+		} else if !errclass.IsStorageObjectMissing(err) {
+			is.log.Warn().Err(err).Str("component", "dedupe").
+				Msg("failed to check restore-complete marker; continuing with dedupe restore scan")
 		}
 	}
 
@@ -2893,4 +3074,65 @@ func (bs *blobStream) Read(buf []byte) (int, error) {
 
 func (bs *blobStream) Close() error {
 	return bs.closer.Close()
+}
+
+// statRepoDir confirms the repository layout directory exists.
+// Missing wraps ErrRepoNotFound (HTTP NAME_UNKNOWN) while keeping the Missing
+// cause. Transient/Permanent Stat failures are returned unchanged. A path that
+// exists but is not a directory is Permanent layout corruption, not absence.
+// Unclassified Stat errors become Transient — never invent Missing/RepoNotFound.
+// Drivers' formatErr must already have classified PathNotFound as Missing.
+func (is *ImageStore) statRepoDir(repo string) error {
+	dir := path.Join(is.rootDir, repo)
+
+	fileInfo, err := is.storeDriver.Stat(dir)
+	if err != nil {
+		if errclass.IsStorageObjectMissing(err) {
+			return errclass.Wrap(zerr.ErrRepoNotFound, err)
+		}
+
+		if errors.Is(err, zerr.ErrStorageTransient) || errors.Is(err, zerr.ErrStoragePermanent) {
+			return err
+		}
+
+		return errclass.MarkTransient(err)
+	}
+
+	if !fileInfo.IsDir() {
+		return errclass.MarkPermanent(zerr.ErrRepoBadLayout)
+	}
+
+	return nil
+}
+
+// mapStorageErr preserves ErrStorage* / ErrCacheMiss through ImageStore blob APIs.
+// Absence also wraps ErrBlobNotFound for HTTP callers. Transient/Permanent are
+// never wrapped with ErrBlobNotFound. Drivers' formatErr must already have
+// classified PathNotFound as ErrStorageMissing before errors reach here.
+// See pkg/storage/README.md.
+func mapStorageErr(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	if errors.Is(err, zerr.ErrBlobNotFound) {
+		return err
+	}
+
+	if errors.Is(err, zerr.ErrCacheMiss) {
+		return errclass.Wrap(zerr.ErrBlobNotFound, err)
+	}
+
+	if errors.Is(err, zerr.ErrStorageMissing) {
+		return errclass.Wrap(zerr.ErrBlobNotFound, err)
+	}
+
+	if errors.Is(err, zerr.ErrStorageTransient) || errors.Is(err, zerr.ErrStoragePermanent) {
+		return err
+	}
+
+	// Should not be reached in production: drivers' formatErr must classify
+	// every I/O error before it reaches ImageStore. Unclassified input is
+	// treated as Transient — never invent Missing.
+	return errclass.MarkTransient(err)
 }

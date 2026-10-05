@@ -15,6 +15,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	dockerList "github.com/distribution/distribution/v3/manifest/manifestlist"
 	docker "github.com/distribution/distribution/v3/manifest/schema2"
+	guuid "github.com/gofrs/uuid"
 	godigest "github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	. "github.com/smartystreets/goconvey/convey"
@@ -452,6 +453,15 @@ func TestParseStorageWithRedisDB(t *testing.T) {
 func TestParseStorageDynamoWrapper(t *testing.T) {
 	tskip.SkipDynamo(t)
 
+	// Unique table names once per test: ResetTable deletes tables; shared fixed names race
+	// with other packages (e.g. pkg/api TestObjectStorageController) under `go test ./...`.
+	// Keep the UUID outside the outer Convey so GoConvey re-runs for nested cases in
+	// RunParseStorageTests reuse one table set instead of creating a new one each time.
+	tableSuffix, err := guuid.NewV4()
+	if err != nil {
+		panic(err)
+	}
+
 	Convey("Dynamodb", t, func() {
 		rootDir := t.TempDir()
 		log := log.NewLogger("debug", "/dev/null")
@@ -459,12 +469,12 @@ func TestParseStorageDynamoWrapper(t *testing.T) {
 		params := dynamodb.DBDriverParameters{
 			Endpoint:               os.Getenv("DYNAMODBMOCK_ENDPOINT"),
 			Region:                 "us-east-2",
-			RepoMetaTablename:      "RepoMetadataTable",
-			RepoBlobsInfoTablename: "RepoBlobsInfoTablename",
-			ImageMetaTablename:     "ImageMetaTablename",
-			UserDataTablename:      "UserDataTable",
-			APIKeyTablename:        "ApiKeyTable",
-			VersionTablename:       "Version",
+			RepoMetaTablename:      "RepoMetadataTable" + tableSuffix.String(),
+			RepoBlobsInfoTablename: "RepoBlobsInfoTablename" + tableSuffix.String(),
+			ImageMetaTablename:     "ImageMetaTablename" + tableSuffix.String(),
+			UserDataTablename:      "UserDataTable" + tableSuffix.String(),
+			APIKeyTablename:        "ApiKeyTable" + tableSuffix.String(),
+			VersionTablename:       "Version" + tableSuffix.String(),
 		}
 
 		dynamoClient, err := dynamodb.GetDynamoClient(params)
@@ -667,6 +677,50 @@ func RunParseStorageTests(rootDir string, metaDB mTypes.MetaDB, log log.Logger) 
 		So(repoMeta.Signatures, ShouldContainKey, subjectDigest)
 		So(repoMeta.Signatures[subjectDigest], ShouldContainKey, zcommon.CosignSignature)
 		So(len(repoMeta.Signatures[subjectDigest][zcommon.CosignSignature]), ShouldBeGreaterThan, 0)
+	})
+
+	Convey("Index cosign bundle attestations as referrers, not signatures", func() {
+		imageStore := local.NewImageStore(rootDir, false, false,
+			log, monitoring.NewNopMetricServer(), nil, nil, nil, nil)
+
+		storeController := storage.StoreController{DefaultStore: imageStore}
+
+		signedImage := CreateRandomImage()
+		err := WriteImageToFileSystem(signedImage, repo, "signed", storeController)
+		So(err, ShouldBeNil)
+
+		bundleSig := CreateMockCosignBundleSignature(signedImage.DescriptorRef())
+		err = WriteImageToFileSystem(bundleSig, repo, bundleSig.DigestStr(), storeController)
+		So(err, ShouldBeNil)
+
+		attestation := CreateMockCosignBundleAttestation(signedImage.DescriptorRef(), "https://spdx.dev/Document")
+		err = WriteImageToFileSystem(attestation, repo, attestation.DigestStr(), storeController)
+		So(err, ShouldBeNil)
+
+		err = meta.ParseStorage(metaDB, storeController, log) //nolint: contextcheck
+		So(err, ShouldBeNil)
+
+		repoMeta, err := metaDB.GetRepoMeta(ctx, repo)
+		So(err, ShouldBeNil)
+
+		subjectDigest := signedImage.DigestStr()
+
+		// slot 0 of the list is reserved for a legacy .sig signature and stays empty here
+		signatureDigests := []string{}
+
+		for _, sigInfo := range repoMeta.Signatures[subjectDigest][zcommon.CosignSignature] {
+			if sigInfo.SignatureManifestDigest != "" {
+				signatureDigests = append(signatureDigests, sigInfo.SignatureManifestDigest)
+			}
+		}
+
+		So(signatureDigests, ShouldResemble, []string{bundleSig.DigestStr()})
+
+		So(repoMeta.Referrers[subjectDigest], ShouldHaveLength, 1)
+		referrer := repoMeta.Referrers[subjectDigest][0]
+		So(referrer.Digest, ShouldEqual, attestation.DigestStr())
+		So(referrer.ArtifactType, ShouldEqual, zcommon.ArtifactTypeCosignBundle)
+		So(referrer.Annotations[zcommon.CosignBundlePredicateTypeAnnotation], ShouldEqual, "https://spdx.dev/Document")
 	})
 
 	Convey("Check statistics after load", func() {
@@ -1022,10 +1076,10 @@ func TestGetSignatureLayersInfo(t *testing.T) {
 		So(layers, ShouldBeEmpty)
 	})
 
-	Convey("GetBlobContent errors", t, func() {
+	Convey("signature layer missing from storage", t, func() {
 		mockImageStore := mocks.MockedImageStore{}
-		mockImageStore.GetBlobContentFn = func(repo string, digest godigest.Digest) ([]byte, error) {
-			return nil, errMetaTestInjected
+		mockImageStore.StatBlobFn = func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+			return false, -1, time.Time{}, errMetaTestInjected
 		}
 		image := CreateRandomImage()
 
@@ -1045,10 +1099,10 @@ func TestGetSignatureLayersInfo(t *testing.T) {
 		So(layers, ShouldBeEmpty)
 	})
 
-	Convey("notation GetBlobContent errors", t, func() {
+	Convey("notation signature layer missing from storage", t, func() {
 		mockImageStore := mocks.MockedImageStore{}
-		mockImageStore.GetBlobContentFn = func(repo string, digest godigest.Digest) ([]byte, error) {
-			return nil, errMetaTestInjected
+		mockImageStore.StatBlobFn = func(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+			return false, -1, time.Time{}, errMetaTestInjected
 		}
 		image := CreateImageWith().RandomLayers(1, 10).RandomConfig().Build()
 
@@ -1056,6 +1110,21 @@ func TestGetSignatureLayersInfo(t *testing.T) {
 			image.ManifestDescriptor.Data, mockImageStore, log.NewTestLogger())
 		So(err, ShouldNotBeNil)
 		So(layers, ShouldBeEmpty)
+	})
+
+	Convey("signature layers are recorded by digest, their content stays in storage", t, func() {
+		mockImageStore := mocks.MockedImageStore{
+			GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+				return nil, errMetaTestInjected
+			},
+		}
+		image := CreateImageWith().RandomLayers(1, 10).RandomConfig().Build()
+
+		layers, err := meta.GetSignatureLayersInfo("repo", "tag", "123", zcommon.CosignSignature,
+			image.ManifestDescriptor.Data, mockImageStore, log.NewTestLogger())
+		So(err, ShouldBeNil)
+		So(layers, ShouldHaveLength, 1)
+		So(layers[0].LayerDigest, ShouldEqual, image.Manifest.Layers[0].Digest.String())
 	})
 
 	Convey("error while unmarshaling manifest content", t, func() {

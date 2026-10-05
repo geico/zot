@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net"
@@ -44,6 +45,10 @@ const (
 	maxSourceIPs         = 1000
 	httpTimeout          = 30 * time.Second
 	TLSHandshakeTimeout  = 10 * time.Second
+	// Seed uploads must succeed before scored requests can run. Retry a few
+	// times on timeout-class errors (common under concurrent large PUTs).
+	maxSeedPushAttempts  = 3
+	seedPushRetryBackoff = 500 * time.Millisecond
 )
 
 //nolint:gochecknoglobals
@@ -390,7 +395,8 @@ func GetCatalog(
 
 	for range suiteCfg.requests {
 		// Push random blob
-		_, repos, err = pushMonolithImage(suiteCfg.workDir, suiteCfg.targetServerURL, suiteCfg.repo, repos, config, client)
+		_, repos, err = pushMonolithImageWithRetry(
+			suiteCfg.workDir, suiteCfg.targetServerURL, suiteCfg.repo, repos, config, client)
 		if err != nil {
 			return err
 		}
@@ -539,7 +545,7 @@ func Pull(
 		config.size = smallBlob
 
 		// Push small blob
-		manifestBySize, repos, err := pushMonolithImage(
+		manifestBySize, repos, err := pushMonolithImageWithRetry(
 			suiteCfg.workDir, pushTargetURL, suiteCfg.repo, repos, config, client)
 		if err != nil {
 			return err
@@ -550,7 +556,7 @@ func Pull(
 		config.size = mediumBlob
 
 		// Push medium blob
-		manifestBySize, repos, err = pushMonolithImage(
+		manifestBySize, repos, err = pushMonolithImageWithRetry(
 			suiteCfg.workDir, pushTargetURL, suiteCfg.repo, repos, config, client)
 		if err != nil {
 			return err
@@ -562,7 +568,7 @@ func Pull(
 
 		// Push large blob
 		//nolint: ineffassign, staticcheck, wastedassign
-		manifestBySize, repos, err = pushMonolithImage(
+		manifestBySize, repos, err = pushMonolithImageWithRetry(
 			suiteCfg.workDir, pushTargetURL, suiteCfg.repo, repos, config, client)
 		if err != nil {
 			return err
@@ -573,7 +579,7 @@ func Pull(
 		// Push blob given size
 		var err error
 
-		manifestHash, repos, err = pushMonolithImage(
+		manifestHash, repos, err = pushMonolithImageWithRetry(
 			suiteCfg.workDir, pushTargetURL, suiteCfg.repo, repos, config, client)
 		if err != nil {
 			return err
@@ -619,7 +625,7 @@ func MixedPullAndPush(
 	statusRequests = sync.Map{}
 
 	// Push blob given size
-	manifestHash, repos, err := pushMonolithImage(
+	manifestHash, repos, err := pushMonolithImageWithRetry(
 		suiteCfg.workDir, suiteCfg.targetServerURL, suiteCfg.repo, repos, config, client)
 	if err != nil {
 		return err
@@ -977,6 +983,8 @@ func Perf(
 
 // isTimeoutError reports whether err looks like a request timeout (or the common
 // client-side symptom when a server closes the connection after its own timeout).
+// That includes unexpected EOF from a truncated response after http.Server
+// WriteTimeout cuts a long blob transfer mid-stream.
 func isTimeoutError(err error) bool {
 	if err == nil {
 		return false
@@ -987,7 +995,7 @@ func isTimeoutError(err error) bool {
 		return true
 	}
 
-	if errors.Is(err, os.ErrDeadlineExceeded) {
+	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
 
@@ -995,7 +1003,35 @@ func isTimeoutError(err error) bool {
 
 	return strings.Contains(msg, "timeout") ||
 		strings.Contains(msg, "deadline exceeded") ||
-		strings.Contains(msg, "use of closed network connection")
+		strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "unexpected eof")
+}
+
+// retryOnTimeoutError runs op up to maxSeedPushAttempts times while errors are
+// timeout-class. Non-timeout errors fail immediately. backoff is applied between
+// attempts when > 0.
+func retryOnTimeoutError(backoff time.Duration, op func() error) error {
+	var err error
+
+	for attempt := 1; attempt <= maxSeedPushAttempts; attempt++ {
+		err = op()
+		if err == nil {
+			return nil
+		}
+
+		if !isTimeoutError(err) || attempt == maxSeedPushAttempts {
+			return err
+		}
+
+		log.Printf("timeout-class error (attempt %d/%d), retrying: %v",
+			attempt, maxSeedPushAttempts, err)
+
+		if backoff > 0 {
+			time.Sleep(backoff)
+		}
+	}
+
+	return err
 }
 
 // shouldFailRun reports whether the run should exit non-zero.

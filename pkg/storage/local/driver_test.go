@@ -8,6 +8,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
@@ -335,10 +336,70 @@ func TestLink(t *testing.T) {
 			So(err, ShouldBeNil)
 		})
 
-		Convey("Test linking non-existent file", func() {
-			destFile := path.Join(rootDir, "link.txt")
-			err := driver.Link("/nonexistent", destFile)
+		Convey("Test linking a path onto itself is a no-op", func() {
+			srcFile := path.Join(rootDir, "self.txt")
+			err := os.WriteFile(srcFile, []byte("keep me"), 0o600)
+			So(err, ShouldBeNil)
+
+			err = driver.Link(srcFile, srcFile)
+			So(err, ShouldBeNil)
+
+			content, err := os.ReadFile(srcFile)
+			So(err, ShouldBeNil)
+			So(string(content), ShouldEqual, "keep me")
+		})
+
+		Convey("Test linking cleaned-equivalent paths is a no-op", func() {
+			srcFile := path.Join(rootDir, "self.txt")
+			err := os.WriteFile(srcFile, []byte("keep me"), 0o600)
+			So(err, ShouldBeNil)
+
+			// Avoid path.Join: it cleans "./" away and would only repeat the exact-self test.
+			equivDest := rootDir + "/./self.txt"
+			So(equivDest, ShouldNotEqual, srcFile)
+
+			err = driver.Link(srcFile, equivDest)
+			So(err, ShouldBeNil)
+
+			content, err := os.ReadFile(srcFile)
+			So(err, ShouldBeNil)
+			So(string(content), ShouldEqual, "keep me")
+		})
+
+		Convey("Test linking a missing path onto itself still errors", func() {
+			missing := path.Join(rootDir, "missing.txt")
+			err := driver.Link(missing, missing)
 			So(err, ShouldNotBeNil)
+		})
+
+		Convey("Test linking non-existent file", func() {
+			srcFile := "/nonexistent"
+			destFile := path.Join(rootDir, "link.txt")
+			err := driver.Link(srcFile, destFile)
+			So(err, ShouldNotBeNil)
+
+			var pathNotFoundErr storagedriver.PathNotFoundError
+
+			So(errors.As(err, &pathNotFoundErr), ShouldBeTrue)
+			So(pathNotFoundErr.Path, ShouldEqual, srcFile)
+			So(errors.Is(err, zerr.ErrStorageMissing), ShouldBeTrue)
+		})
+
+		Convey("Test linking when destination parent is missing", func() {
+			srcFile := path.Join(rootDir, "source.txt")
+			err := os.WriteFile(srcFile, []byte("test content"), 0o600)
+			So(err, ShouldBeNil)
+
+			destDir := path.Join(rootDir, "missing-parent")
+			destFile := path.Join(destDir, "link.txt")
+			err = driver.Link(srcFile, destFile)
+			So(err, ShouldNotBeNil)
+
+			var pathNotFoundErr storagedriver.PathNotFoundError
+
+			So(errors.As(err, &pathNotFoundErr), ShouldBeTrue)
+			So(pathNotFoundErr.Path, ShouldEqual, destDir)
+			So(errors.Is(err, zerr.ErrStorageMissing), ShouldBeTrue)
 		})
 
 		Convey("Test linking to existing destination", func() {
@@ -362,9 +423,12 @@ func TestLink(t *testing.T) {
 		})
 
 		Convey("Test Link() with os.Remove error to trigger return err", func() {
-			// Link should return os.Remove error
+			// NUL in dest makes os.Remove fail with EINVAL (not IsNotExist).
 			err := driver.Link("", string([]byte{0x00}))
 			So(err, ShouldNotBeNil)
+			So(errors.Is(err, zerr.ErrStoragePermanent), ShouldBeTrue)
+			So(errors.Is(err, zerr.ErrStorageTransient), ShouldBeFalse)
+			So(errors.Is(err, syscall.EINVAL), ShouldBeTrue)
 		})
 	})
 }
@@ -603,6 +667,14 @@ func TestReader(t *testing.T) {
 			var pathNotFoundErr storagedriver.PathNotFoundError
 
 			So(errors.As(err, &pathNotFoundErr), ShouldBeTrue)
+		})
+
+		Convey("Test ReadFile() on directory → EISDIR Permanent", func() {
+			_, err := driver.ReadFile(rootDir)
+			So(err, ShouldNotBeNil)
+			So(errors.Is(err, zerr.ErrStoragePermanent), ShouldBeTrue)
+			So(errors.Is(err, zerr.ErrStorageTransient), ShouldBeFalse)
+			So(errors.Is(err, syscall.EISDIR), ShouldBeTrue)
 		})
 
 		Convey("Test Reader() with file.Seek error to trigger formatErr", func() {

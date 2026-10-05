@@ -229,9 +229,14 @@ type (
 )
 
 type ImageTrustStore interface {
-	VerifySignature(
-		signatureType string, rawSignature []byte, sigKey string, manifestDigest godigest.Digest, imageMeta ImageMeta,
-		repo string,
+	// VerifySignatureLayer loads the signature layer layerDigest of repo from storage and verifies that it signs
+	// manifestDigest. A layer the image store reports as not found (ErrBlobNotFound / classified Missing) is not
+	// trusted, without an error. Transient/Permanent GetBlob failures are not BlobNotFound-shaped; together with
+	// other load failures they surface as an error wrapping zerr.ErrSignatureLayerUnavailable so callers keep the
+	// previous result.
+	VerifySignatureLayer(
+		signatureType string, layerDigest godigest.Digest, sigKey string, manifestDigest godigest.Digest,
+		imageMeta ImageMeta, repo string,
 	) (Author, ExpiryDate, Validity, error)
 }
 
@@ -371,7 +376,6 @@ type ManifestSignatures map[SignatureType][]SignatureInfo
 
 type LayerInfo struct {
 	LayerDigest  string
-	LayerContent []byte
 	SignatureKey string
 	Signer       string
 	Date         time.Time
