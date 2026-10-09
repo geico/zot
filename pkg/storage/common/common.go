@@ -32,10 +32,7 @@ import (
 	storageTypes "zotregistry.dev/zot/v2/pkg/storage/types"
 )
 
-const (
-	manifestWithEmptyLayersErrMsg = "layers/minItems: minimum 1 items required, but found 0 items"
-	cosignSignatureTagSuffix      = "sig"
-)
+const manifestWithEmptyLayersErrMsg = "layers/minItems: minimum 1 items required, but found 0 items"
 
 func GetTagsByIndex(index ispec.Index) []string {
 	tags := make([]string, 0)
@@ -117,14 +114,14 @@ func ValidateManifest(imgStore storageTypes.ImageStore, repo, reference, mediaTy
 				log.Error().Err(err).Str("digest", manifest.Config.Digest.String()).
 					Msg("failed to stat blob due to missing config blob")
 
-				return zerr.ErrBadManifest
+				return missingBlobError(manifest.Config.Digest)
 			}
 
 			if !ok {
 				log.Error().Str("digest", manifest.Config.Digest.String()).
 					Msg("failed to stat blob due to missing config blob")
 
-				return zerr.ErrBadManifest
+				return missingBlobError(manifest.Config.Digest)
 			}
 
 			// validate layers - a lightweight check if the blob is present
@@ -148,14 +145,14 @@ func ValidateManifest(imgStore storageTypes.ImageStore, repo, reference, mediaTy
 					log.Error().Err(err).Str("digest", layer.Digest.String()).
 						Msg("failed to validate manifest due to missing layer blob")
 
-					return zerr.ErrBadManifest
+					return missingBlobError(layer.Digest)
 				}
 
 				if !ok {
 					log.Error().Str("digest", layer.Digest.String()).
 						Msg("failed to validate manifest due to missing layer blob")
 
-					return zerr.ErrBadManifest
+					return missingBlobError(layer.Digest)
 				}
 			}
 		}
@@ -202,14 +199,14 @@ func ValidateManifest(imgStore storageTypes.ImageStore, repo, reference, mediaTy
 				log.Error().Err(err).Str("digest", desc.Digest.String()).
 					Msg("failed to stat non-OCI descriptor due to missing blob")
 
-				return zerr.ErrBadManifest
+				return missingBlobError(desc.Digest)
 			}
 
 			if !ok {
 				log.Error().Str("digest", desc.Digest.String()).
 					Msg("failed to stat non-OCI descriptor due to missing blob")
 
-				return zerr.ErrBadManifest
+				return missingBlobError(desc.Digest)
 			}
 		}
 	case dockerList.MediaTypeManifestList:
@@ -224,6 +221,11 @@ func ValidateManifest(imgStore storageTypes.ImageStore, repo, reference, mediaTy
 	}
 
 	return nil
+}
+
+func missingBlobError(digest godigest.Digest) error {
+	return zerr.NewError(fmt.Errorf("%w: %w", zerr.ErrBadManifest, zerr.ErrBlobNotFound)).
+		AddDetail("digest", digest.String())
 }
 
 // GetAndValidateRequestDigest returns the canonical digest or the digest provided by the reference if any.
@@ -817,8 +819,8 @@ func IsSignature(descriptor ispec.Descriptor) bool {
 
 	switch descriptor.MediaType {
 	case ispec.MediaTypeImageManifest:
-		// is cosgin signature
-		if strings.HasPrefix(tag, "sha256-") && strings.HasSuffix(tag, cosignSignatureTagSuffix) {
+		// is legacy cosign signature tag; malformed lookalikes such as "sha256-abc.sig" are linted as images
+		if zcommon.IsCosignSignature(tag) {
 			return true
 		}
 
@@ -1001,9 +1003,17 @@ func getBlobDescriptorFromIndex(imgStore storageTypes.ImageStore, index ispec.In
 		case compat.IsImageManifestMediaType(desc.MediaType):
 			seen[desc.Digest] = struct{}{}
 
-			if foundDescriptor, err := getBlobDescriptorFromManifest(imgStore, repo, blobDigest, desc, log); err == nil {
+			foundDescriptor, err := getBlobDescriptorFromManifest(imgStore, repo, blobDigest, desc, log)
+			if err == nil {
 				return foundDescriptor, nil
 			}
+
+			// Soft-skip only absence; Transient/Permanent must not collapse to ErrBlobNotFound.
+			if errclass.IsBlobUnavailable(err) {
+				continue
+			}
+
+			return ispec.Descriptor{}, err
 		case compat.IsImageIndexMediaType(desc.MediaType):
 			seen[desc.Digest] = struct{}{}
 
@@ -1024,6 +1034,12 @@ func getBlobDescriptorFromIndex(imgStore storageTypes.ImageStore, index ispec.In
 			if err == nil {
 				return foundDescriptor, nil
 			}
+
+			if errclass.IsBlobUnavailable(err) {
+				continue
+			}
+
+			return ispec.Descriptor{}, err
 		}
 	}
 

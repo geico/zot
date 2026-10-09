@@ -411,6 +411,7 @@ func TestValidateManifestStorageErrorClasses(t *testing.T) {
 
 			err := common.ValidateManifest(imgStore, "test", "1.0", ispec.MediaTypeImageManifest, body, nil, log)
 			So(errors.Is(err, zerr.ErrBadManifest), ShouldBeTrue)
+			So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeTrue)
 		})
 
 		Convey("ErrStorageTransient on config propagates unchanged", func() {
@@ -452,6 +453,7 @@ func TestValidateManifestStorageErrorClasses(t *testing.T) {
 
 			err := common.ValidateManifest(imgStore, "test", "1.0", ispec.MediaTypeImageManifest, body, nil, log)
 			So(errors.Is(err, zerr.ErrBadManifest), ShouldBeTrue)
+			So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeTrue)
 		})
 
 		Convey("StatBlob ok=false with nil err on layer → ErrBadManifest", func() {
@@ -467,6 +469,7 @@ func TestValidateManifestStorageErrorClasses(t *testing.T) {
 
 			err := common.ValidateManifest(imgStore, "test", "1.0", ispec.MediaTypeImageManifest, body, nil, log)
 			So(errors.Is(err, zerr.ErrBadManifest), ShouldBeTrue)
+			So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeTrue)
 		})
 
 		Convey("ErrStorageMissing on docker descriptor → ErrBadManifest", func() {
@@ -498,6 +501,7 @@ func TestValidateManifestStorageErrorClasses(t *testing.T) {
 
 			err = common.ValidateManifest(imgStore, "test", "docker", docker.MediaTypeManifest, manBody, compats, log)
 			So(errors.Is(err, zerr.ErrBadManifest), ShouldBeTrue)
+			So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeTrue)
 		})
 
 		Convey("ErrStorageTransient on docker descriptor propagates unchanged", func() {
@@ -562,6 +566,7 @@ func TestValidateManifestStorageErrorClasses(t *testing.T) {
 
 			err = common.ValidateManifest(imgStore, "test", "docker", docker.MediaTypeManifest, manBody, compats, log)
 			So(errors.Is(err, zerr.ErrBadManifest), ShouldBeTrue)
+			So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeTrue)
 		})
 	})
 }
@@ -1110,6 +1115,22 @@ func TestIsSignature(t *testing.T) {
 			MediaType: "unknown media type",
 		})
 		So(isSingature, ShouldBeFalse)
+	})
+
+	Convey("Legacy cosign signature tags must be well formed", t, func(c C) {
+		isTagSignature := func(tag string) bool {
+			return common.IsSignature(ispec.Descriptor{
+				MediaType:   ispec.MediaTypeImageManifest,
+				Annotations: map[string]string{ispec.AnnotationRefName: tag},
+			})
+		}
+
+		So(isTagSignature("sha256-"+strings.Repeat("a", 64)+".sig"), ShouldBeTrue)
+
+		// lookalikes are ordinary images and must still be linted
+		So(isTagSignature("sha256-abc.sig"), ShouldBeFalse)
+		So(isTagSignature("sha256-imagesig"), ShouldBeFalse)
+		So(isTagSignature("sha256-"+strings.Repeat("a", 64)+"sig"), ShouldBeFalse)
 	})
 }
 
@@ -2838,6 +2859,62 @@ func TestGetBlobDescriptorFromIndexCoverage(t *testing.T) {
 
 		_, err := common.GetBlobDescriptorFromIndex(imgStore, index, "repo", godigest.FromString("x"), log)
 		So(err, ShouldEqual, ErrTestError)
+	})
+
+	Convey("Transient reading an image manifest propagates (not ErrBlobNotFound)", t, func(c C) {
+		manifestDigest := godigest.FromString("transient-manifest-for-desc")
+		index := ispec.Index{
+			Manifests: []ispec.Descriptor{
+				{MediaType: ispec.MediaTypeImageManifest, Digest: manifestDigest},
+			},
+		}
+
+		imgStore := &mocks.MockedImageStore{
+			GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+				return nil, zerr.ErrStorageTransient
+			},
+		}
+
+		_, err := common.GetBlobDescriptorFromIndex(imgStore, index, "repo", godigest.FromString("x"), log)
+		So(errors.Is(err, zerr.ErrStorageTransient), ShouldBeTrue)
+		So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeFalse)
+	})
+
+	Convey("Transient from nested index search propagates (not ErrBlobNotFound)", t, func(c C) {
+		nestedIndexDigest := godigest.FromString("nested-index-for-desc")
+		nestedManifestDigest := godigest.FromString("nested-manifest-for-desc")
+		transient := errclass.MarkTransient(errors.New("nested blip")) //nolint:err113 // test
+
+		nestedIndexBuf, err := json.Marshal(ispec.Index{
+			Manifests: []ispec.Descriptor{
+				{MediaType: ispec.MediaTypeImageManifest, Digest: nestedManifestDigest},
+			},
+		})
+		So(err, ShouldBeNil)
+
+		index := ispec.Index{
+			Manifests: []ispec.Descriptor{
+				{MediaType: ispec.MediaTypeImageIndex, Digest: nestedIndexDigest},
+			},
+		}
+
+		imgStore := &mocks.MockedImageStore{
+			GetBlobContentFn: func(repo string, digest godigest.Digest) ([]byte, error) {
+				if digest == nestedIndexDigest {
+					return nestedIndexBuf, nil
+				}
+
+				if digest == nestedManifestDigest {
+					return nil, transient
+				}
+
+				return nil, zerr.ErrBlobNotFound
+			},
+		}
+
+		_, err = common.GetBlobDescriptorFromIndex(imgStore, index, "repo", godigest.FromString("x"), log)
+		So(errors.Is(err, zerr.ErrStorageTransient), ShouldBeTrue)
+		So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeFalse)
 	})
 
 	Convey("Missing nested index is skipped; sibling manifest supplies the descriptor", t, func(c C) {

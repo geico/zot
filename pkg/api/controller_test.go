@@ -7859,6 +7859,11 @@ func TestInvalidCases(t *testing.T) {
 // existing repo maps to Permanent HTTP 500 via writeStorageClassError, not a
 // client-facing 404 (NAME_UNKNOWN / MANIFEST_UNKNOWN / BLOB_UNKNOWN).
 func TestHTTPStorageFSPermissionDenied(t *testing.T) {
+	// Root can still read/write mode 000 paths; same guard as local driver tests.
+	if os.Geteuid() == 0 {
+		t.Skip("chmod 000 does not deny root")
+	}
+
 	Convey("local FS permission denials map to Permanent 500, not client 404", t, func() {
 		conf := config.New()
 		conf.HTTP.Port = "0"
@@ -9248,6 +9253,53 @@ func TestDeleteManifestMissingRepo(t *testing.T) {
 		So(json.Unmarshal(resp.Body(), &errList), ShouldBeNil)
 		So(errList.Errors, ShouldNotBeEmpty)
 		So(errList.Errors[0].Code, ShouldEqual, "NAME_UNKNOWN")
+	})
+}
+
+func TestPutManifestMissingBlob(t *testing.T) {
+	Convey("Pushing a manifest that references a missing blob returns MANIFEST_BLOB_UNKNOWN", t, func() {
+		conf := config.New()
+		conf.HTTP.Port = "0"
+
+		ctlr := makeController(conf, t.TempDir())
+		cm := test.NewControllerManager(ctlr)
+		baseURL := cm.StartAndWait()
+
+		defer cm.StopServer()
+
+		img := CreateRandomImage()
+		So(UploadImage(img, baseURL, "missing-blob", "1.0"), ShouldBeNil)
+
+		missing := godigest.FromString("never uploaded")
+
+		putManifest := func(manifest ispec.Manifest) {
+			body, err := json.Marshal(manifest)
+			So(err, ShouldBeNil)
+
+			resp, err := resty.R().SetHeader("Content-Type", ispec.MediaTypeImageManifest).
+				SetBody(body).Put(baseURL + "/v2/missing-blob/manifests/2.0")
+			So(err, ShouldBeNil)
+			So(resp.StatusCode(), ShouldEqual, http.StatusBadRequest)
+
+			var errList apiErr.ErrorList
+			So(json.Unmarshal(resp.Body(), &errList), ShouldBeNil)
+			So(errList.Errors, ShouldHaveLength, 1)
+			So(errList.Errors[0].Code, ShouldEqual, "MANIFEST_BLOB_UNKNOWN")
+			So(errList.Errors[0].Detail["digest"], ShouldEqual, missing.String())
+		}
+
+		Convey("missing layer", func() {
+			manifest := img.Manifest
+			manifest.Layers = append([]ispec.Descriptor(nil), manifest.Layers...)
+			manifest.Layers[0].Digest = missing
+			putManifest(manifest)
+		})
+
+		Convey("missing config", func() {
+			manifest := img.Manifest
+			manifest.Config.Digest = missing
+			putManifest(manifest)
+		})
 	})
 }
 
