@@ -106,6 +106,28 @@ func NewImageStore(rootDir string, cacheDir string, dedupe, commit bool, log zlo
 	return imgStore
 }
 
+// WithRepoLock runs wrappedFunc while holding the store's single write lock. The repo name
+// does not select anything, and cannot simply start to: see storageTypes.ImageStore for why
+// work on one repo can reach blobs stored under another.
+func (is *ImageStore) WithRepoLock(_ string, wrappedFunc func() error) error {
+	var lockLatency time.Time
+
+	is.Lock(&lockLatency)
+	defer is.Unlock(&lockLatency)
+
+	return wrappedFunc()
+}
+
+// WithRepoReadLock is WithRepoLock's read-lock counterpart.
+func (is *ImageStore) WithRepoReadLock(_ string, wrappedFunc func() error) error {
+	var lockLatency time.Time
+
+	is.RLock(&lockLatency)
+	defer is.RUnlock(&lockLatency)
+
+	return wrappedFunc()
+}
+
 // RLock read-lock.
 func (is *ImageStore) RLock(lockStart *time.Time) {
 	*lockStart = time.Now()

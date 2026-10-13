@@ -27,7 +27,7 @@ CRICTL_VERSION := v1.26.1
 ACTION_VALIDATOR := $(TOOLSDIR)/bin/action-validator
 ACTION_VALIDATOR_VERSION := v0.5.3
 ZUI_BUILD_PATH := ""
-ZUI_VERSION := commit-8e8457d
+ZUI_VERSION := commit-ce3819c
 ZUI_REPO_OWNER := project-zot
 ZUI_REPO_NAME := zui
 SWAGGER_VERSION := v1.16.6
@@ -630,6 +630,11 @@ run-blackbox-dedupe-nightly: check-blackbox-prerequisites check-awslocal $(ZOT_B
 run-blackbox-sync-nightly: check-blackbox-prerequisites $(ZOT_BIN_DEP) $(ZOT_MIN_DEP) $(ZB_DEP)
 	echo running nightly sync tests; \
 	$(BATS) $(BATS_FLAGS) test/blackbox/sync_harness.bats
+
+.PHONY: run-blackbox-sync-streaming-stress
+run-blackbox-sync-streaming-stress: check-blackbox-prerequisites $(ZOT_BIN_DEP)
+	echo running nightly sync streaming stress tests; \
+	$(BATS) $(BATS_FLAGS) test/blackbox/sync_streaming_stress.bats
 
 .PHONY: run-kind-sync-ondemand
 run-kind-sync-ondemand: $(KIND) $(ZOT_BIN_DEP)
