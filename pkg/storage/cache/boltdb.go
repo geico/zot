@@ -349,6 +349,16 @@ func (d *BoltDBDriver) GetBlob(digest godigest.Digest) (string, error) {
 }
 
 func (d *BoltDBDriver) HasBlob(digest godigest.Digest, blob string) bool {
+	// records are stored relative to rootDir, as PutBlob wrote them
+	if d.useRelPaths {
+		relBlob, err := filepath.Rel(d.rootDir, blob)
+		if err != nil {
+			d.log.Error().Err(err).Str("path", blob).Msg("failed to get relative path")
+		} else {
+			blob = relBlob
+		}
+	}
+
 	if err := d.db.View(func(tx *bbolt.Tx) error {
 		root := tx.Bucket([]byte(constants.BlobsCache))
 		if root == nil {
@@ -419,14 +429,16 @@ func (d *BoltDBDriver) DeleteBlob(digest godigest.Digest, path string) error {
 			return err
 		}
 
+		// An untracked digest is not an error: the delete is idempotent, as it is in the
+		// Redis and DynamoDB drivers.
 		bucket := root.Bucket([]byte(digest.String()))
 		if bucket == nil {
-			return zerr.ErrCacheMiss
+			return nil
 		}
 
 		deduped := bucket.Bucket([]byte(constants.DuplicatesBucket))
 		if deduped == nil {
-			return zerr.ErrCacheMiss
+			return nil
 		}
 
 		if err := deduped.Delete([]byte(path)); err != nil {

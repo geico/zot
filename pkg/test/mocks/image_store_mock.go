@@ -44,6 +44,7 @@ type MockedImageStore struct {
 	BlobPathFn         func(repo string, digest godigest.Digest) string
 	CheckBlobFn        func(ctx context.Context, repo string, digest godigest.Digest) (bool, int64, error)
 	StatBlobFn         func(repo string, digest godigest.Digest) (bool, int64, time.Time, error)
+	StatBlobEntryFn    func(repo string, digest godigest.Digest) (bool, int64, time.Time, error)
 	GetBlobPartialFn   func(repo string, digest godigest.Digest, mediaType string, from, to int64,
 	) (io.ReadCloser, int64, int64, error)
 	GetBlobFn            func(repo string, digest godigest.Digest, mediaType string) (io.ReadCloser, int64, error)
@@ -82,6 +83,26 @@ func (is MockedImageStore) WithRepoLock(repo string, wrappedFunc func() error) e
 }
 
 func (is MockedImageStore) WithRepoReadLock(repo string, wrappedFunc func() error) error {
+	return wrappedFunc()
+}
+
+func (is MockedImageStore) WithBlobstoreLock(wrappedFunc func() error) error {
+	return wrappedFunc()
+}
+
+func (is MockedImageStore) WithBlobstoreReadLock(wrappedFunc func() error) error {
+	return wrappedFunc()
+}
+
+func (is MockedImageStore) WithBlobstoreAndRepoLock(repo string, wrappedFunc func() error) error {
+	return wrappedFunc()
+}
+
+func (is MockedImageStore) WithBlobstoreReadAndRepoLock(repo string, wrappedFunc func() error) error {
+	return wrappedFunc()
+}
+
+func (is MockedImageStore) WithRepoCleanupLock(repo string, wrappedFunc func() error) error {
 	return wrappedFunc()
 }
 
@@ -324,6 +345,20 @@ func (is MockedImageStore) CheckBlob(ctx context.Context, repo string, digest go
 }
 
 func (is MockedImageStore) StatBlob(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+	if is.StatBlobFn != nil {
+		return is.StatBlobFn(repo, digest)
+	}
+
+	return true, 0, time.Time{}, nil
+}
+
+func (is MockedImageStore) StatBlobEntry(repo string, digest godigest.Digest) (bool, int64, time.Time, error) {
+	if is.StatBlobEntryFn != nil {
+		return is.StatBlobEntryFn(repo, digest)
+	}
+
+	// Age-check tests historically mocked StatBlob; fall back so they keep working
+	// until callers assert entry-local timing separately.
 	if is.StatBlobFn != nil {
 		return is.StatBlobFn(repo, digest)
 	}

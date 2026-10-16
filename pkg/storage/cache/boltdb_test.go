@@ -51,8 +51,9 @@ func TestBoltDBCache(t *testing.T) {
 		So(err, ShouldBeNil)
 		So(val, ShouldNotBeEmpty)
 
+		// DeleteBlob is idempotent: deleting an untracked digest or path is a no-op, not an error.
 		err = cacheDriver.DeleteBlob("bogusKey", "bogusValue")
-		So(err, ShouldEqual, errors.ErrCacheMiss)
+		So(err, ShouldBeNil)
 
 		err = cacheDriver.DeleteBlob("key", "bogusValue")
 		So(err, ShouldBeNil)
@@ -258,5 +259,29 @@ func TestBoltDBDeleteNonOriginDuplicate(t *testing.T) {
 		val, err = cacheDriver.GetBlob("digest")
 		So(err, ShouldBeNil)
 		So(val, ShouldEqual, "zebra")
+	})
+}
+
+func TestBoltDBHasBlobRelativePaths(t *testing.T) {
+	Convey("HasBlob finds a blob put by its absolute path when the cache stores relative paths", t, func() {
+		dir := t.TempDir()
+
+		log := log.NewTestLogger()
+
+		cacheDriver, _ := storage.Create("boltdb", cache.BoltDBDriverParameters{dir, "cache_test", true}, log)
+		So(cacheDriver, ShouldNotBeNil)
+
+		origin := path.Join(dir, "repo-a", "blobs", "sha256", "abc")
+		duplicate := path.Join(dir, "repo-b", "blobs", "sha256", "abc")
+
+		So(cacheDriver.PutBlob("digest", origin), ShouldBeNil)
+		So(cacheDriver.PutBlob("digest", duplicate), ShouldBeNil)
+
+		So(cacheDriver.HasBlob("digest", origin), ShouldBeTrue)
+		So(cacheDriver.HasBlob("digest", duplicate), ShouldBeTrue)
+		So(cacheDriver.HasBlob("digest", path.Join(dir, "repo-c", "blobs", "sha256", "abc")), ShouldBeFalse)
+
+		So(cacheDriver.DeleteBlob("digest", origin), ShouldBeNil)
+		So(cacheDriver.HasBlob("digest", origin), ShouldBeFalse)
 	})
 }
