@@ -70,6 +70,7 @@ type TrivyConfig struct {
 	ScanRemovedPkgs     bool   // default is false, same as Trivy's --removed-pkgs flag
 	IncludeDevDeps      bool   // default is false, same as Trivy's --include-dev-deps flag
 	SBOM                *SBOMConfig
+	VulnerabilityReport *VulnerabilityReportConfig
 }
 
 type SBOMConfig struct {
@@ -77,6 +78,10 @@ type SBOMConfig struct {
 	// Format controls the generated SBOM output format.
 	// Supported values are "spdx-json" (default) and "cyclonedx".
 	Format string
+}
+
+type VulnerabilityReportConfig struct {
+	Enable bool
 }
 
 type MetricsConfig struct {

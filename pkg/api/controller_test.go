@@ -9895,6 +9895,137 @@ func TestArtifactReferences(t *testing.T) {
 	})
 }
 
+func TestVulnerabilityReportDistributionReadPath(t *testing.T) {
+	Convey("report artifacts use the distribution API and repository read authorization", t, func() {
+		const (
+			repoName       = "report-repo"
+			reader         = "report-reader"
+			readerPassword = "reader-password"
+			blockedUser    = "report-blocked"
+			blockedPass    = "blocked-password"
+			artifactType   = "application/vnd.zot.trivy.vulnerability-report.v1+json"
+		)
+
+		conf := config.New()
+		conf.HTTP.Port = "0"
+		conf.HTTP.Auth = &config.AuthConfig{
+			HTPasswd: config.AuthHTPasswd{
+				Path: test.MakeHtpasswdFileFromString(t,
+					test.GetBcryptCredString(reader, readerPassword)+"\n"+
+						test.GetBcryptCredString(blockedUser, blockedPass)),
+			},
+		}
+		conf.HTTP.AccessControl = &config.AccessControlConfig{
+			Repositories: config.Repositories{
+				test.AuthorizationAllRepos: config.PolicyGroup{
+					Policies: []config.Policy{{
+						Users:   []string{reader},
+						Actions: []string{"read", "create"},
+					}},
+				},
+			},
+		}
+
+		ctlr := makeController(conf, t.TempDir())
+		cm := test.NewControllerManager(ctlr)
+		baseURL := cm.StartAndWait()
+		defer cm.StopServer()
+
+		readerClient := func() *resty.Request {
+			return resty.R().SetBasicAuth(reader, readerPassword)
+		}
+		blockedClient := func() *resty.Request {
+			return resty.R().SetBasicAuth(blockedUser, blockedPass)
+		}
+		subject := CreateDefaultImage()
+		So(UploadImageWithBasicAuth(subject, baseURL, repoName, "1.0", reader, readerPassword), ShouldBeNil)
+
+		uploadBlob := func(blob []byte) godigest.Digest {
+			blobDigest := godigest.FromBytes(blob)
+			response, err := readerClient().Post(baseURL + "/v2/" + repoName + "/blobs/uploads/")
+			So(err, ShouldBeNil)
+			So(response.StatusCode(), ShouldEqual, http.StatusAccepted)
+
+			response, err = readerClient().SetContentLength(true).
+				SetHeader("Content-Length", strconv.Itoa(len(blob))).
+				SetHeader("Content-Type", "application/octet-stream").
+				SetQueryParam("digest", blobDigest.String()).
+				SetBody(blob).
+				Put(test.Location(baseURL, response))
+			So(err, ShouldBeNil)
+			So(response.StatusCode(), ShouldEqual, http.StatusCreated)
+
+			return blobDigest
+		}
+
+		reportBlob := []byte(`{"artifactName":"report-repo@` + subject.DigestStr() + `","results":[]}`)
+		reportDigest := uploadBlob(reportBlob)
+		configBlob := ispec.DescriptorEmptyJSON.Data
+		configDigest := uploadBlob(configBlob)
+		manifest := ispec.Manifest{
+			SchemaVersion: 2,
+			MediaType:     ispec.MediaTypeImageManifest,
+			ArtifactType:  artifactType,
+			Subject: &ispec.Descriptor{
+				MediaType: ispec.MediaTypeImageManifest,
+				Digest:    subject.ManifestDescriptor.Digest,
+				Size:      subject.ManifestDescriptor.Size,
+			},
+			Config: ispec.Descriptor{
+				MediaType: ispec.MediaTypeEmptyJSON,
+				Digest:    configDigest,
+				Size:      int64(len(configBlob)),
+			},
+			Layers: []ispec.Descriptor{{
+				MediaType: artifactType,
+				Digest:    reportDigest,
+				Size:      int64(len(reportBlob)),
+			}},
+		}
+		manifestBlob, err := json.Marshal(manifest)
+		So(err, ShouldBeNil)
+		manifestDigest := godigest.FromBytes(manifestBlob)
+		response, err := readerClient().SetHeader("Content-Type", ispec.MediaTypeImageManifest).
+			SetBody(manifestBlob).
+			Put(baseURL + "/v2/" + repoName + "/manifests/" + manifestDigest.String())
+		So(err, ShouldBeNil)
+		So(response.StatusCode(), ShouldEqual, http.StatusCreated)
+
+		referrersURL := baseURL + "/v2/" + repoName + "/referrers/" + subject.DigestStr()
+		response, err = readerClient().SetQueryParam("artifactType", artifactType).Get(referrersURL)
+		So(err, ShouldBeNil)
+		So(response.StatusCode(), ShouldEqual, http.StatusOK)
+
+		var referrers ispec.Index
+		So(json.Unmarshal(response.Body(), &referrers), ShouldBeNil)
+		So(referrers.Manifests, ShouldHaveLength, 1)
+		So(referrers.Manifests[0].Digest, ShouldEqual, manifestDigest)
+
+		manifestURL := baseURL + "/v2/" + repoName + "/manifests/" + manifestDigest.String()
+		response, err = readerClient().Get(manifestURL)
+		So(err, ShouldBeNil)
+		So(response.StatusCode(), ShouldEqual, http.StatusOK)
+
+		var fetchedManifest ispec.Manifest
+		So(json.Unmarshal(response.Body(), &fetchedManifest), ShouldBeNil)
+		So(fetchedManifest.ArtifactType, ShouldEqual, artifactType)
+		So(fetchedManifest.Subject.Digest, ShouldEqual, subject.ManifestDescriptor.Digest)
+		So(fetchedManifest.Layers, ShouldHaveLength, 1)
+
+		blobURL := baseURL + "/v2/" + repoName + "/blobs/" + fetchedManifest.Layers[0].Digest.String()
+		response, err = readerClient().Get(blobURL)
+		So(err, ShouldBeNil)
+		So(response.StatusCode(), ShouldEqual, http.StatusOK)
+		So(response.Body(), ShouldResemble, reportBlob)
+
+		for _, url := range []string{referrersURL, manifestURL, blobURL} {
+			response, err = blockedClient().Get(url)
+			So(err, ShouldBeNil)
+			So(response.StatusCode(), ShouldEqual, http.StatusForbidden)
+		}
+	})
+}
+
 //nolint:dupl // duplicated test code
 func TestRouteFailures(t *testing.T) {
 	Convey("Make a new controller", t, func() {
