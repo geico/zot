@@ -1674,6 +1674,7 @@ To set those options explicitly (for example to mirror standalone Trivy’s `--v
 
 - [config-cve-trivy.json](config-cve-trivy.json) — shows optional `dbRepository`, `javaDBRepository`, `vulnSeveritySources`, `detectionPriority`, `scanRemovedPkgs`, and `includeDevDeps`.
 - [config-sbom-trivy.json](config-sbom-trivy.json) — adds `sbom` to generate SBOMs during scanning.
+- [config-cve-trivy-vulnerability-report.json](config-cve-trivy-vulnerability-report.json) — opts in to native Trivy vulnerability reports as OCI referrers.
 
 `ignoreFile` specifies the path to a [Trivy ignore file](https://trivy.dev/docs/latest/configuration/filtering/#trivyignore) and supports the same plain-text and YAML formats as Trivy's `--ignorefile` option. The file must exist and be readable when zot loads its configuration. Relative paths are resolved from zot's process working directory, not from the directory containing the zot configuration file, so use an absolute path in deployments, for example `"ignoreFile": "/etc/zot/.trivyignore"`. A sample [`.trivyignore`](.trivyignore) is included in this directory.
 
@@ -1686,3 +1687,23 @@ Scan results are cached by manifest digest. Editing an ignore file does not inva
 `scanRemovedPkgs` mirrors Trivy's `--removed-pkgs` and reports vulnerabilities for packages deleted in later image layers. `includeDevDeps` mirrors Trivy's `--include-dev-deps` and reports development dependencies. Both default to `false`.
 
 `sbom.enable` lets zot generate SBOMs while scanning and store them as OCI artifacts attached to the scanned image. `sbom.format` supports `spdx-json` (default) and `cyclonedx`.
+
+`vulnerabilityReport.enable` opts in to publishing the filtered native Trivy JSON report as an OCI artifact. It is disabled by default or when set to `false`. Each successful Trivy scan (not a cache hit) attempts to publish a new immutable snapshot referring to the exact platform manifest that was scanned. Multi-platform images therefore have reports on eligible platform manifests, not on the image index. The artifact is an OCI image manifest with an empty JSON config and one native Trivy JSON layer; the artifact and layer media type is `application/vnd.zot.trivy.vulnerability-report.v1+json`.
+
+### Retrieving vulnerability reports
+
+Use the standard distribution API; zot adds no report-specific endpoint. Resolve an image tag to a manifest digest first. If it resolves to an image index, select the platform manifest you want before discovering reports. Request referrers with the report artifact type, follow any pagination links, then fetch the selected artifact manifest and its single JSON layer:
+
+```sh
+curl -fsS --get \
+  --data-urlencode "artifactType=application/vnd.zot.trivy.vulnerability-report.v1+json" \
+  "$REGISTRY/v2/$REPOSITORY/referrers/$PLATFORM_DIGEST"
+curl -fsS "$REGISTRY/v2/$REPOSITORY/manifests/$REPORT_DIGEST"
+curl -fsS "$REGISTRY/v2/$REPOSITORY/blobs/$REPORT_LAYER_DIGEST"
+```
+
+Use the registry's normal authentication options for each request. When several snapshots are returned, referrer order is not meaningful; clients should select the greatest valid `org.opencontainers.image.created` timestamp and use the artifact digest as a stable tie-breaker. The timestamp is scan completion time, not evidence that the report used the latest vulnerability database.
+
+Publication is best-effort and happens after real scans, not CVE cache hits. CVE results are cached by manifest digest, while referrers are repository-scoped; a cache hit in another repository does not backfill a report there. A missing report means no snapshot is available, not that the image has no vulnerabilities. Disabling generation does not remove existing artifacts. Zot retains snapshots it publishes, but operator deletion and configured garbage collection or retention can remove them; plan for storage growth until an external cleanup policy is applied.
+
+The report contains Trivy's filtered native output and is not an unfiltered CLI scan. Artifact media types and annotations identify the format but do not prove zot generated it; reports are not signed, and another authorized writer can publish matching artifacts. Existing repository read authorization applies to referrer discovery, artifact manifests, and report blobs.

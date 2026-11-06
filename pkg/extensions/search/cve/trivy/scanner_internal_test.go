@@ -57,6 +57,17 @@ type fakeArtifactRunner struct {
 	scanImageFn func(ctx context.Context, opts flag.Options) (trivyTypes.Report, error)
 }
 
+type scanWaitContext struct {
+	context.Context
+	waiting chan<- struct{}
+}
+
+func (ctx scanWaitContext) Done() <-chan struct{} {
+	ctx.waiting <- struct{}{}
+
+	return nil
+}
+
 func (f fakeArtifactRunner) ScanImage(ctx context.Context, opts flag.Options) (trivyTypes.Report, error) {
 	if f.scanImageFn != nil {
 		return f.scanImageFn(ctx, opts)
@@ -1414,6 +1425,32 @@ func TestVulnSeveritySourcesDefaulting(t *testing.T) {
 	})
 }
 
+func TestVulnerabilityReportConfiguration(t *testing.T) {
+	Convey("NewScanner resolves vulnerability report publication configuration", t, func() {
+		configs := []struct {
+			report *extconf.VulnerabilityReportConfig
+			enable bool
+		}{
+			{},
+			{report: &extconf.VulnerabilityReportConfig{}},
+			{report: &extconf.VulnerabilityReportConfig{Enable: true}, enable: true},
+		}
+
+		for _, cfg := range configs {
+			scanner := NewScanner(storage.StoreController{}, nil, &extconf.CVEConfig{
+				Trivy: &extconf.TrivyConfig{
+					DBRepository:        "ghcr.io/project-zot/trivy-db",
+					VulnerabilityReport: cfg.report,
+				},
+			}, log.NewTestLogger())
+
+			So(scanner.vulnerabilityReportOptions.enabled, ShouldEqual, cfg.enable)
+			So(scanner.vulnerabilityReportOptions.artifactType, ShouldEqual, defaultVulnerabilityReportArtifactType)
+			So(scanner.vulnerabilityReportOptions.layerMediaType, ShouldEqual, defaultVulnerabilityReportLayerMediaType)
+		}
+	})
+}
+
 func TestIgnoreFileConfiguration(t *testing.T) {
 	Convey("getNewScanOptions passes the configured ignore file to Trivy", t, func() {
 		const ignoreFile = "/etc/zot/.trivyignore.yaml"
@@ -1583,6 +1620,512 @@ func TestStoreSBOMAsOCIArtifact(t *testing.T) {
 		referrers, err = store.GetReferrers("repo", subjectDigest, []string{defaultSBOMArtifactType})
 		So(err, ShouldBeNil)
 		So(len(referrers.Manifests), ShouldEqual, 1)
+	})
+}
+
+func TestStoreVulnerabilityReportAsOCIArtifact(t *testing.T) {
+	Convey("storeVulnerabilityReportAsOCIArtifact publishes immutable native Trivy snapshots", t, func() {
+		rootDir := t.TempDir()
+		tempDir := t.TempDir()
+		t.Setenv("TMPDIR", tempDir)
+
+		logger := log.NewTestLogger()
+		store := local.NewImageStore(rootDir, false, false, logger,
+			monitoring.NewNopMetricServer(), nil, nil, nil, nil)
+		storeController := storage.StoreController{DefaultStore: store}
+
+		boltDriver, err := boltdb.GetBoltDriver(boltdb.DBParameters{RootDir: rootDir})
+		So(err, ShouldBeNil)
+		metaDB, err := boltdb.New(boltDriver, logger)
+		So(err, ShouldBeNil)
+
+		generateTestImage(storeController, "repo:1.0")
+		_, subjectDigest, _, err := store.GetImageManifest("repo", "1.0")
+		So(err, ShouldBeNil)
+
+		scanner := NewScanner(storeController, metaDB, &extconf.CVEConfig{
+			Trivy: &extconf.TrivyConfig{
+				DBRepository: "ghcr.io/project-zot/trivy-db",
+				VulnerabilityReport: &extconf.VulnerabilityReportConfig{
+					Enable: true,
+				},
+			},
+		}, logger)
+
+		image := "repo@" + subjectDigest.String()
+		scanPath := path.Join(rootDir, image)
+		report := trivyTypes.Report{
+			ArtifactName: scanPath,
+			Results: []trivyTypes.Result{{
+				Target: scanPath,
+				Class:  "os-pkgs",
+				Type:   "debian",
+			}},
+		}
+
+		firstScanTime := time.Date(2026, 10, 28, 12, 0, 0, 0, time.FixedZone("test", -7*60*60))
+		secondScanTime := firstScanTime.Add(time.Minute)
+		for _, createdAt := range []time.Time{firstScanTime, secondScanTime} {
+			err = scanner.storeVulnerabilityReportAsOCIArtifact(context.Background(), "repo", subjectDigest.String(),
+				scanPath, image, report, createdAt)
+			So(err, ShouldBeNil)
+		}
+
+		So(report.ArtifactName, ShouldEqual, scanPath)
+		So(report.Results[0].Target, ShouldEqual, scanPath)
+
+		referrers, err := store.GetReferrers("repo", subjectDigest, []string{defaultVulnerabilityReportArtifactType})
+		So(err, ShouldBeNil)
+		So(len(referrers.Manifests), ShouldEqual, 2)
+
+		metadataReferrers, err := metaDB.GetReferrersInfo("repo", subjectDigest,
+			[]string{defaultVulnerabilityReportArtifactType})
+		So(err, ShouldBeNil)
+		So(len(metadataReferrers), ShouldEqual, 2)
+
+		expectedCreatedAt := map[string]bool{
+			firstScanTime.UTC().Format(time.RFC3339Nano):  true,
+			secondScanTime.UTC().Format(time.RFC3339Nano): true,
+		}
+		for _, referrer := range referrers.Manifests {
+			manifestBlob, _, _, err := store.GetImageManifest("repo", referrer.Digest.String())
+			So(err, ShouldBeNil)
+
+			var reportManifest ispec.Manifest
+			err = json.Unmarshal(manifestBlob, &reportManifest)
+			So(err, ShouldBeNil)
+			So(reportManifest.ArtifactType, ShouldEqual, defaultVulnerabilityReportArtifactType)
+			So(reportManifest.Subject.Digest, ShouldEqual, subjectDigest)
+			createdAt := reportManifest.Annotations[vulnerabilityReportCreatedAnnotation]
+			So(expectedCreatedAt[createdAt], ShouldBeTrue)
+			delete(expectedCreatedAt, createdAt)
+			So(len(reportManifest.Layers), ShouldEqual, 1)
+			So(reportManifest.Layers[0].MediaType, ShouldEqual, defaultVulnerabilityReportLayerMediaType)
+
+			reportBlob, err := store.GetBlobContent("repo", reportManifest.Layers[0].Digest)
+			So(err, ShouldBeNil)
+			So(int64(len(reportBlob)), ShouldEqual, reportManifest.Layers[0].Size)
+			So(godigest.FromBytes(reportBlob), ShouldEqual, reportManifest.Layers[0].Digest)
+
+			var storedReport trivyTypes.Report
+			err = json.Unmarshal(reportBlob, &storedReport)
+			So(err, ShouldBeNil)
+			So(storedReport.ArtifactName, ShouldEqual, image)
+			So(storedReport.Results[0].Target, ShouldEqual, image)
+			So(string(storedReport.Results[0].Class), ShouldEqual, "os-pkgs")
+			So(string(storedReport.Results[0].Type), ShouldEqual, "debian")
+		}
+		So(len(expectedCreatedAt), ShouldEqual, 0)
+
+		tempFiles, err := os.ReadDir(tempDir)
+		So(err, ShouldBeNil)
+		So(len(tempFiles), ShouldEqual, 0)
+	})
+}
+
+func TestScanImagePublishesVulnerabilityReport(t *testing.T) {
+	Convey("real scans publish snapshots, while cache hits and failed scans do not", t, func() {
+		rootDir := t.TempDir()
+		logger := log.NewTestLogger()
+		store := local.NewImageStore(rootDir, false, false, logger,
+			monitoring.NewNopMetricServer(), nil, nil, nil, nil)
+		storeController := storage.StoreController{DefaultStore: store}
+		image := generateTestImage(storeController, "repo:1.0")
+
+		dbDir := path.Join(rootDir, "_trivy", "db")
+		So(os.MkdirAll(dbDir, 0o755), ShouldBeNil)
+		So(os.WriteFile(metadata.Path(dbDir), []byte("{}"), 0o600), ShouldBeNil)
+
+		boltDriver, err := boltdb.GetBoltDriver(boltdb.DBParameters{RootDir: rootDir})
+		So(err, ShouldBeNil)
+		metaDB, err := boltdb.New(boltDriver, logger)
+		So(err, ShouldBeNil)
+		So(meta.ParseStorage(metaDB, storeController, logger), ShouldBeNil)
+
+		scanner := NewScanner(storeController, metaDB, &extconf.CVEConfig{
+			Trivy: &extconf.TrivyConfig{
+				DBRepository: "ghcr.io/project-zot/trivy-db",
+				VulnerabilityReport: &extconf.VulnerabilityReportConfig{
+					Enable: true,
+				},
+			},
+		}, logger)
+
+		var scanCalls atomic.Int32
+		var scanErr error
+		oldNewArtifactRunner := newArtifactRunner
+		newArtifactRunner = func(ctx context.Context, opts flag.Options, target artifact.TargetKind,
+			runnerOpts ...artifact.RunnerOption,
+		) (artifact.Runner, error) {
+			return fakeArtifactRunner{
+				scanImageFn: func(ctx context.Context, opts flag.Options) (trivyTypes.Report, error) {
+					scanCalls.Add(1)
+					if scanErr != nil {
+						return trivyTypes.Report{}, scanErr
+					}
+
+					return trivyTypes.Report{
+						ArtifactName: opts.ScanOptions.Target,
+						Results: []trivyTypes.Result{{
+							Target: opts.ScanOptions.Target,
+						}},
+					}, nil
+				},
+			}, nil
+		}
+		defer func() {
+			newArtifactRunner = oldNewArtifactRunner
+		}()
+
+		firstResult, err := scanner.ScanImage(context.Background(), "repo:1.0")
+		So(err, ShouldBeNil)
+		So(firstResult.WasCached, ShouldBeFalse)
+		So(scanCalls.Load(), ShouldEqual, 1)
+
+		subjectDigest := godigest.Digest(image.DigestStr())
+		referrers, err := store.GetReferrers("repo", subjectDigest, []string{defaultVulnerabilityReportArtifactType})
+		So(err, ShouldBeNil)
+		So(len(referrers.Manifests), ShouldEqual, 1)
+		isScannable, err := scanner.IsImageMediaScannable("repo", referrers.Manifests[0].Digest.String(),
+			referrers.Manifests[0].MediaType)
+		So(err, ShouldWrap, zerr.ErrScanNotSupported)
+		So(isScannable, ShouldBeFalse)
+
+		cachedResult, err := scanner.ScanImage(context.Background(), "repo:1.0")
+		So(err, ShouldBeNil)
+		So(cachedResult.WasCached, ShouldBeTrue)
+		So(scanCalls.Load(), ShouldEqual, 1)
+
+		scanErr = errors.New("synthetic scan failure")
+		scanner.cache.Purge()
+		_, err = scanner.ScanImage(context.Background(), "repo:1.0")
+		So(err, ShouldNotBeNil)
+		So(scanner.IsResultCached("repo", image.DigestStr()), ShouldBeFalse)
+		So(scanCalls.Load(), ShouldEqual, 2)
+
+		referrers, err = store.GetReferrers("repo", subjectDigest, []string{defaultVulnerabilityReportArtifactType})
+		So(err, ShouldBeNil)
+		So(len(referrers.Manifests), ShouldEqual, 1)
+
+		scanErr = nil
+		rescanResult, err := scanner.ScanImage(context.Background(), "repo:1.0")
+		So(err, ShouldBeNil)
+		So(rescanResult.WasCached, ShouldBeFalse)
+		So(scanCalls.Load(), ShouldEqual, 3)
+
+		referrers, err = store.GetReferrers("repo", subjectDigest, []string{defaultVulnerabilityReportArtifactType})
+		So(err, ShouldBeNil)
+		So(len(referrers.Manifests), ShouldEqual, 2)
+	})
+}
+
+func TestConcurrentScanImageCallsPublishOneReport(t *testing.T) {
+	Convey("concurrent callers sharing one scan publish a single report", t, func() {
+		rootDir := t.TempDir()
+		logger := log.NewTestLogger()
+		store := local.NewImageStore(rootDir, false, false, logger,
+			monitoring.NewNopMetricServer(), nil, nil, nil, nil)
+		storeController := storage.StoreController{DefaultStore: store}
+		image := generateTestImage(storeController, "repo:1.0")
+
+		dbDir := path.Join(rootDir, "_trivy", "db")
+		So(os.MkdirAll(dbDir, 0o755), ShouldBeNil)
+		So(os.WriteFile(metadata.Path(dbDir), []byte("{}"), 0o600), ShouldBeNil)
+
+		boltDriver, err := boltdb.GetBoltDriver(boltdb.DBParameters{RootDir: rootDir})
+		So(err, ShouldBeNil)
+		metaDB, err := boltdb.New(boltDriver, logger)
+		So(err, ShouldBeNil)
+		So(meta.ParseStorage(metaDB, storeController, logger), ShouldBeNil)
+
+		scanner := NewScanner(storeController, metaDB, &extconf.CVEConfig{
+			Trivy: &extconf.TrivyConfig{
+				DBRepository: "ghcr.io/project-zot/trivy-db",
+				VulnerabilityReport: &extconf.VulnerabilityReportConfig{
+					Enable: true,
+				},
+			},
+		}, logger)
+
+		const callerCount = 8
+		waiters := make(chan struct{}, callerCount)
+		scanStarted := make(chan struct{})
+		releaseScan := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() {
+			releaseOnce.Do(func() { close(releaseScan) })
+		}
+		defer release()
+
+		var scanCalls atomic.Int32
+		var startOnce sync.Once
+		oldNewArtifactRunner := newArtifactRunner
+		newArtifactRunner = func(ctx context.Context, opts flag.Options, target artifact.TargetKind,
+			runnerOpts ...artifact.RunnerOption,
+		) (artifact.Runner, error) {
+			return fakeArtifactRunner{
+				scanImageFn: func(ctx context.Context, opts flag.Options) (trivyTypes.Report, error) {
+					scanCalls.Add(1)
+					startOnce.Do(func() { close(scanStarted) })
+					<-releaseScan
+
+					return trivyTypes.Report{ArtifactName: opts.ScanOptions.Target}, nil
+				},
+			}, nil
+		}
+		defer func() {
+			newArtifactRunner = oldNewArtifactRunner
+		}()
+
+		type scanOutcome struct {
+			wasCached bool
+			err       error
+		}
+		outcomes := make(chan scanOutcome, callerCount)
+		ctx := scanWaitContext{Context: context.Background(), waiting: waiters}
+		for i := 0; i < callerCount; i++ {
+			go func() {
+				result, err := scanner.ScanImage(ctx, "repo:1.0")
+				outcomes <- scanOutcome{wasCached: result.WasCached, err: err}
+			}()
+		}
+
+		select {
+		case <-scanStarted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Trivy scan did not start")
+		}
+
+		for i := 0; i < callerCount; i++ {
+			select {
+			case <-waiters:
+			case <-time.After(5 * time.Second):
+				t.Fatal("not all callers joined the scan")
+			}
+		}
+		release()
+
+		for i := 0; i < callerCount; i++ {
+			outcome := <-outcomes
+			So(outcome.err, ShouldBeNil)
+			So(outcome.wasCached, ShouldBeFalse)
+		}
+		So(scanCalls.Load(), ShouldEqual, 1)
+
+		referrers, err := store.GetReferrers("repo", godigest.Digest(image.DigestStr()),
+			[]string{defaultVulnerabilityReportArtifactType})
+		So(err, ShouldBeNil)
+		So(referrers.Manifests, ShouldHaveLength, 1)
+	})
+}
+
+type failingManifestStore struct {
+	storageTypes.ImageStore
+}
+
+func (store failingManifestStore) PutImageManifest(
+	ctx context.Context,
+	repo string,
+	reference string,
+	mediaType string,
+	body []byte,
+	extraTags []string,
+) (godigest.Digest, godigest.Digest, error) {
+	return "", "", errors.New("synthetic manifest write failure")
+}
+
+func TestScanImageReportPublicationFailureDoesNotFailScan(t *testing.T) {
+	Convey("report publication failure does not invalidate CVE results", t, func() {
+		rootDir := t.TempDir()
+		logger := log.NewTestLogger()
+		localStore := local.NewImageStore(rootDir, false, false, logger,
+			monitoring.NewNopMetricServer(), nil, nil, nil, nil)
+		image := generateTestImage(storage.StoreController{DefaultStore: localStore}, "repo:1.0")
+
+		dbDir := path.Join(rootDir, "_trivy", "db")
+		So(os.MkdirAll(dbDir, 0o755), ShouldBeNil)
+		So(os.WriteFile(metadata.Path(dbDir), []byte("{}"), 0o600), ShouldBeNil)
+
+		boltDriver, err := boltdb.GetBoltDriver(boltdb.DBParameters{RootDir: rootDir})
+		So(err, ShouldBeNil)
+		metaDB, err := boltdb.New(boltDriver, logger)
+		So(err, ShouldBeNil)
+		So(meta.ParseStorage(metaDB, storage.StoreController{DefaultStore: localStore}, logger), ShouldBeNil)
+
+		storeController := storage.StoreController{DefaultStore: failingManifestStore{ImageStore: localStore}}
+		scanner := NewScanner(storeController, metaDB, &extconf.CVEConfig{
+			Trivy: &extconf.TrivyConfig{
+				DBRepository: "ghcr.io/project-zot/trivy-db",
+				VulnerabilityReport: &extconf.VulnerabilityReportConfig{
+					Enable: true,
+				},
+			},
+		}, logger)
+
+		oldNewArtifactRunner := newArtifactRunner
+		newArtifactRunner = func(ctx context.Context, opts flag.Options, target artifact.TargetKind,
+			runnerOpts ...artifact.RunnerOption,
+		) (artifact.Runner, error) {
+			return fakeArtifactRunner{
+				scanImageFn: func(ctx context.Context, opts flag.Options) (trivyTypes.Report, error) {
+					return trivyTypes.Report{
+						ArtifactName: opts.ScanOptions.Target,
+						Results: []trivyTypes.Result{{
+							Target: opts.ScanOptions.Target,
+							Vulnerabilities: []trivyTypes.DetectedVulnerability{{
+								VulnerabilityID:  "CVE-2026-1234",
+								PkgName:          "test-package",
+								InstalledVersion: "1.0.0",
+							}},
+						}},
+					}, nil
+				},
+			}, nil
+		}
+		defer func() {
+			newArtifactRunner = oldNewArtifactRunner
+		}()
+
+		result, err := scanner.ScanImage(context.Background(), "repo:1.0")
+		So(err, ShouldBeNil)
+		So(result.CVEMap, ShouldContainKey, "CVE-2026-1234")
+		So(scanner.IsResultCached("repo", image.DigestStr()), ShouldBeTrue)
+
+		referrers, err := localStore.GetReferrers("repo", godigest.Digest(image.DigestStr()),
+			[]string{defaultVulnerabilityReportArtifactType})
+		So(err, ShouldBeNil)
+		So(len(referrers.Manifests), ShouldEqual, 0)
+	})
+}
+
+func TestScanImagePublishesReportsForPlatformManifests(t *testing.T) {
+	Convey("multi-arch scans publish referrers for platform manifests, not the index", t, func() {
+		rootDir := t.TempDir()
+		logger := log.NewTestLogger()
+		store := local.NewImageStore(rootDir, false, false, logger,
+			monitoring.NewNopMetricServer(), nil, nil, nil, nil)
+		storeController := storage.StoreController{DefaultStore: store}
+
+		amd64Image := CreateImageWith().DefaultLayers().PlatformConfig("amd64", "linux").Build()
+		arm64Image := CreateImageWith().DefaultLayers().PlatformConfig("arm64", "linux").Build()
+		indexImage := CreateMultiarchWith().Images([]Image{amd64Image, arm64Image}).Build()
+		So(WriteMultiArchImageToFileSystem(indexImage, "repo", "multi", storeController), ShouldBeNil)
+
+		dbDir := path.Join(rootDir, "_trivy", "db")
+		So(os.MkdirAll(dbDir, 0o755), ShouldBeNil)
+		So(os.WriteFile(metadata.Path(dbDir), []byte("{}"), 0o600), ShouldBeNil)
+
+		boltDriver, err := boltdb.GetBoltDriver(boltdb.DBParameters{RootDir: rootDir})
+		So(err, ShouldBeNil)
+		metaDB, err := boltdb.New(boltDriver, logger)
+		So(err, ShouldBeNil)
+		So(meta.ParseStorage(metaDB, storeController, logger), ShouldBeNil)
+
+		scanner := NewScanner(storeController, metaDB, &extconf.CVEConfig{
+			Trivy: &extconf.TrivyConfig{
+				DBRepository: "ghcr.io/project-zot/trivy-db",
+				VulnerabilityReport: &extconf.VulnerabilityReportConfig{
+					Enable: true,
+				},
+			},
+		}, logger)
+
+		var scanCalls atomic.Int32
+		oldNewArtifactRunner := newArtifactRunner
+		newArtifactRunner = func(ctx context.Context, opts flag.Options, target artifact.TargetKind,
+			runnerOpts ...artifact.RunnerOption,
+		) (artifact.Runner, error) {
+			return fakeArtifactRunner{
+				scanImageFn: func(ctx context.Context, opts flag.Options) (trivyTypes.Report, error) {
+					scanCalls.Add(1)
+					return trivyTypes.Report{ArtifactName: opts.ScanOptions.Target}, nil
+				},
+			}, nil
+		}
+		defer func() {
+			newArtifactRunner = oldNewArtifactRunner
+		}()
+
+		result, err := scanner.ScanImage(context.Background(), "repo:multi")
+		So(err, ShouldBeNil)
+		So(result.Digest, ShouldEqual, indexImage.DigestStr())
+		So(scanCalls.Load(), ShouldEqual, 2)
+
+		for _, platformImage := range []Image{amd64Image, arm64Image} {
+			referrers, err := store.GetReferrers("repo", godigest.Digest(platformImage.DigestStr()),
+				[]string{defaultVulnerabilityReportArtifactType})
+			So(err, ShouldBeNil)
+			So(len(referrers.Manifests), ShouldEqual, 1)
+		}
+
+		indexReferrers, err := store.GetReferrers("repo", godigest.Digest(indexImage.DigestStr()),
+			[]string{defaultVulnerabilityReportArtifactType})
+		So(err, ShouldBeNil)
+		So(len(indexReferrers.Manifests), ShouldEqual, 0)
+	})
+}
+
+func TestScanImageDoesNotBackfillReportOnCrossRepositoryCacheHit(t *testing.T) {
+	Convey("a shared digest cache hit does not publish a report in another repository", t, func() {
+		rootDir := t.TempDir()
+		logger := log.NewTestLogger()
+		store := local.NewImageStore(rootDir, false, false, logger,
+			monitoring.NewNopMetricServer(), nil, nil, nil, nil)
+		storeController := storage.StoreController{DefaultStore: store}
+		image := CreateImageWith().DefaultLayers().RandomConfig().Build()
+		So(WriteImageToFileSystem(image, "repo-a", "1.0", storeController), ShouldBeNil)
+		So(WriteImageToFileSystem(image, "repo-b", "1.0", storeController), ShouldBeNil)
+
+		dbDir := path.Join(rootDir, "_trivy", "db")
+		So(os.MkdirAll(dbDir, 0o755), ShouldBeNil)
+		So(os.WriteFile(metadata.Path(dbDir), []byte("{}"), 0o600), ShouldBeNil)
+
+		boltDriver, err := boltdb.GetBoltDriver(boltdb.DBParameters{RootDir: rootDir})
+		So(err, ShouldBeNil)
+		metaDB, err := boltdb.New(boltDriver, logger)
+		So(err, ShouldBeNil)
+		So(meta.ParseStorage(metaDB, storeController, logger), ShouldBeNil)
+
+		scanner := NewScanner(storeController, metaDB, &extconf.CVEConfig{
+			Trivy: &extconf.TrivyConfig{
+				DBRepository: "ghcr.io/project-zot/trivy-db",
+				VulnerabilityReport: &extconf.VulnerabilityReportConfig{
+					Enable: true,
+				},
+			},
+		}, logger)
+
+		var scanCalls atomic.Int32
+		oldNewArtifactRunner := newArtifactRunner
+		newArtifactRunner = func(ctx context.Context, opts flag.Options, target artifact.TargetKind,
+			runnerOpts ...artifact.RunnerOption,
+		) (artifact.Runner, error) {
+			return fakeArtifactRunner{
+				scanImageFn: func(ctx context.Context, opts flag.Options) (trivyTypes.Report, error) {
+					scanCalls.Add(1)
+					return trivyTypes.Report{ArtifactName: opts.ScanOptions.Target}, nil
+				},
+			}, nil
+		}
+		defer func() {
+			newArtifactRunner = oldNewArtifactRunner
+		}()
+
+		_, err = scanner.ScanImage(context.Background(), "repo-a:1.0")
+		So(err, ShouldBeNil)
+		_, err = scanner.ScanImage(context.Background(), "repo-b:1.0")
+		So(err, ShouldBeNil)
+		So(scanCalls.Load(), ShouldEqual, 1)
+
+		subjectDigest := godigest.Digest(image.DigestStr())
+		repoAReferrers, err := store.GetReferrers("repo-a", subjectDigest,
+			[]string{defaultVulnerabilityReportArtifactType})
+		So(err, ShouldBeNil)
+		So(len(repoAReferrers.Manifests), ShouldEqual, 1)
+		repoBReferrers, err := store.GetReferrers("repo-b", subjectDigest,
+			[]string{defaultVulnerabilityReportArtifactType})
+		So(err, ShouldBeNil)
+		So(len(repoBReferrers.Manifests), ShouldEqual, 0)
 	})
 }
 
