@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aquasecurity/trivy-db/pkg/metadata"
 	dbTypes "github.com/aquasecurity/trivy-db/pkg/types"
@@ -45,16 +46,20 @@ import (
 	mTypes "zotregistry.dev/zot/v2/pkg/meta/types"
 	"zotregistry.dev/zot/v2/pkg/storage"
 	storageConstants "zotregistry.dev/zot/v2/pkg/storage/constants"
+	storageTypes "zotregistry.dev/zot/v2/pkg/storage/types"
 )
 
 const cacheSize = 1000000
 
 const (
-	defaultSBOMFormat         = types.FormatSPDXJSON
-	defaultSBOMArtifactType   = "application/spdx+json"
-	defaultSBOMLayerMediaType = "application/spdx+json"
-	cycloneDXArtifactType     = "application/vnd.cyclonedx+json"
-	cycloneDXLayerMediaType   = "application/vnd.cyclonedx+json"
+	defaultSBOMFormat                        = types.FormatSPDXJSON
+	defaultSBOMArtifactType                  = "application/spdx+json"
+	defaultSBOMLayerMediaType                = "application/spdx+json"
+	defaultVulnerabilityReportArtifactType   = "application/vnd.zot.trivy.vulnerability-report.v1+json"
+	defaultVulnerabilityReportLayerMediaType = "application/vnd.zot.trivy.vulnerability-report.v1+json"
+	vulnerabilityReportCreatedAnnotation     = "org.opencontainers.image.created"
+	cycloneDXArtifactType                    = "application/vnd.cyclonedx+json"
+	cycloneDXLayerMediaType                  = "application/vnd.cyclonedx+json"
 )
 
 var initTrivyLoggerOnce sync.Once //nolint: gochecknoglobals // trivylog.SetDefault modifies slog.Default()
@@ -156,16 +161,17 @@ type cveTrivyController struct {
 }
 
 type Scanner struct {
-	metaDB              mTypes.MetaDB
-	cveController       cveTrivyController
-	storeController     storage.StoreController
-	log                 log.Logger
-	dbLock              *sync.Mutex
-	cache               *cvecache.CveCache
-	dbRepositoryRef     name.Reference
-	javaDBRepositoryRef name.Reference
-	vulnSeveritySources []dbTypes.SourceID
-	sbomOptions         sbomOptions
+	metaDB                     mTypes.MetaDB
+	cveController              cveTrivyController
+	storeController            storage.StoreController
+	log                        log.Logger
+	dbLock                     *sync.Mutex
+	cache                      *cvecache.CveCache
+	dbRepositoryRef            name.Reference
+	javaDBRepositoryRef        name.Reference
+	vulnSeveritySources        []dbTypes.SourceID
+	sbomOptions                sbomOptions
+	vulnerabilityReportOptions vulnerabilityReportOptions
 
 	// SingleFlightGroup is used to prevent multiple requests
 	// running a trivy scan for the same digest repeatedly.
@@ -175,6 +181,12 @@ type Scanner struct {
 type sbomOptions struct {
 	enabled        bool
 	reportFormat   types.Format
+	artifactType   string
+	layerMediaType string
+}
+
+type vulnerabilityReportOptions struct {
+	enabled        bool
 	artifactType   string
 	layerMediaType string
 }
@@ -200,6 +212,7 @@ func NewScanner(storeController storage.StoreController,
 	}
 
 	sbomOpts := getSBOMOptions(trivyCfg.SBOM, log)
+	vulnerabilityReportOpts := getVulnerabilityReportOptions(trivyCfg.VulnerabilityReport)
 
 	dbRepository := trivyCfg.DBRepository
 	javaDBRepository := trivyCfg.JavaDBRepository
@@ -271,17 +284,18 @@ func NewScanner(storeController storage.StoreController,
 	cveController.SubCveConfig = subCveConfig
 
 	return &Scanner{
-		log:                   log,
-		metaDB:                metaDB,
-		cveController:         cveController,
-		storeController:       storeController,
-		dbLock:                &sync.Mutex{},
-		cache:                 cvecache.NewCveCache(cacheSize, log),
-		dbRepositoryRef:       dbRepositoryRef,
-		javaDBRepositoryRef:   javaDBRepositoryRef,
-		vulnSeveritySources:   sevSources,
-		sbomOptions:           sbomOpts,
-		scanSingleFlightGroup: &singleflight.Group{},
+		log:                        log,
+		metaDB:                     metaDB,
+		cveController:              cveController,
+		storeController:            storeController,
+		dbLock:                     &sync.Mutex{},
+		cache:                      cvecache.NewCveCache(cacheSize, log),
+		dbRepositoryRef:            dbRepositoryRef,
+		javaDBRepositoryRef:        javaDBRepositoryRef,
+		vulnSeveritySources:        sevSources,
+		sbomOptions:                sbomOpts,
+		vulnerabilityReportOptions: vulnerabilityReportOpts,
+		scanSingleFlightGroup:      &singleflight.Group{},
 	}
 }
 
@@ -316,6 +330,14 @@ func getSBOMOptions(cfg *extconf.SBOMConfig, logger log.Logger) sbomOptions {
 		Msg("unsupported trivy sbom format, defaulting to spdx-json")
 
 	return options
+}
+
+func getVulnerabilityReportOptions(cfg *extconf.VulnerabilityReportConfig) vulnerabilityReportOptions {
+	return vulnerabilityReportOptions{
+		enabled:        cfg != nil && cfg.Enable,
+		artifactType:   defaultVulnerabilityReportArtifactType,
+		layerMediaType: defaultVulnerabilityReportLayerMediaType,
+	}
 }
 
 func (scanner Scanner) getTrivyOptions(image string) flag.Options {
@@ -822,6 +844,7 @@ func (scanner Scanner) scanManifestUncached(ctx context.Context, repo, digest st
 	scanner.dbLock.Lock()
 	opts := scanner.getTrivyOptions(image)
 	report, sbom, err := scanner.runTrivy(scanCtx, opts)
+	scanCompletedAt := time.Now()
 	scanner.dbLock.Unlock()
 	if sbom != nil && sbom.filePath != "" {
 		defer os.Remove(sbom.filePath)
@@ -829,6 +852,14 @@ func (scanner Scanner) scanManifestUncached(ctx context.Context, repo, digest st
 
 	if err != nil {
 		return cacheableScanResult{}, err
+	}
+
+	if scanner.vulnerabilityReportOptions.enabled {
+		if err = scanner.storeVulnerabilityReportAsOCIArtifact(scanCtx, repo, digest,
+			opts.ScanOptions.Target, image, report, scanCompletedAt); err != nil {
+			scanner.log.Warn().Err(err).Str("image", image).
+				Msg("failed to store Trivy vulnerability report as OCI artifact")
+		}
 	}
 
 	// SBOM persistence is best-effort: CVE scanning should still complete even if
@@ -1047,6 +1078,177 @@ func (scanner Scanner) storeSBOMAsOCIArtifact(ctx context.Context,
 	} else {
 		scanner.log.Debug().Str("repo", repo).Str("subject", subjectDigest).
 			Msg("skipping sbom artifact metadata persistence: metadb not configured")
+	}
+
+	return nil
+}
+
+func (scanner Scanner) storeVulnerabilityReportAsOCIArtifact(ctx context.Context,
+	repo, subjectDigest, scanPath, image string, report types.Report, createdAt time.Time,
+) error {
+	if !scanner.vulnerabilityReportOptions.enabled {
+		return nil
+	}
+
+	imgStore := scanner.storeController.GetImageStore(repo)
+	if imgStore == nil {
+		return fmt.Errorf("%w for repo %q", errImageStoreNotFound, repo)
+	}
+
+	subject := godigest.Digest(subjectDigest)
+	if err := subject.Validate(); err != nil {
+		return err
+	}
+
+	subjectManifestBlob, _, subjectMediaType, err := imgStore.GetImageManifest(repo, subjectDigest)
+	if err != nil {
+		return err
+	}
+
+	reportFilePath, reportDigest, reportSize, err := createVulnerabilityReportFile(report, scanPath, image)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(reportFilePath)
+
+	if err = uploadVulnerabilityReportFile(ctx, imgStore, repo, reportDigest, reportFilePath); err != nil {
+		return err
+	}
+
+	if err = uploadBlobIfMissing(ctx, imgStore, repo, ispec.DescriptorEmptyJSON.Digest,
+		bytes.NewReader(ispec.DescriptorEmptyJSON.Data)); err != nil {
+		return err
+	}
+
+	reportManifest := newVulnerabilityReportManifest(scanner.vulnerabilityReportOptions,
+		ispec.Descriptor{
+			MediaType: subjectMediaType,
+			Digest:    subject,
+			Size:      int64(len(subjectManifestBlob)),
+		}, reportDigest, reportSize, createdAt)
+
+	return scanner.putVulnerabilityReportManifest(ctx, repo, imgStore, reportManifest)
+}
+
+func createVulnerabilityReportFile(report types.Report, scanPath, image string) (string, godigest.Digest, int64, error) {
+	reportForArtifact := report
+	if scanPath != "" {
+		reportForArtifact.ArtifactName = strings.Replace(report.ArtifactName, scanPath, image, 1)
+		if report.Results != nil {
+			reportForArtifact.Results = make([]types.Result, len(report.Results))
+			copy(reportForArtifact.Results, report.Results)
+		}
+
+		for idx := range reportForArtifact.Results {
+			reportForArtifact.Results[idx].Target = strings.Replace(reportForArtifact.Results[idx].Target, scanPath, image, 1)
+		}
+	}
+
+	reportFile, err := os.CreateTemp("", "zot-trivy-vulnerability-report-*.json")
+	if err != nil {
+		return "", "", 0, err
+	}
+	reportFilePath := reportFile.Name()
+	cleanup := func() {
+		_ = reportFile.Close()
+		_ = os.Remove(reportFilePath)
+	}
+
+	if err = json.NewEncoder(reportFile).Encode(reportForArtifact); err != nil {
+		cleanup()
+
+		return "", "", 0, err
+	}
+
+	if err = reportFile.Close(); err != nil {
+		_ = os.Remove(reportFilePath)
+
+		return "", "", 0, err
+	}
+
+	reportDigest, reportSize, err := digestAndSizeFromFile(reportFilePath)
+	if err != nil {
+		_ = os.Remove(reportFilePath)
+
+		return "", "", 0, err
+	}
+
+	return reportFilePath, reportDigest, reportSize, nil
+}
+
+func uploadVulnerabilityReportFile(ctx context.Context, imgStore storageTypes.ImageStore,
+	repo string, reportDigest godigest.Digest, filePath string,
+) error {
+	reportFile, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer reportFile.Close()
+
+	return uploadBlobIfMissing(ctx, imgStore, repo, reportDigest, reportFile)
+}
+
+func uploadBlobIfMissing(ctx context.Context, imgStore storageTypes.ImageStore,
+	repo string, digest godigest.Digest, content io.Reader,
+) error {
+	exists, _, err := imgStore.CheckBlob(ctx, repo, digest)
+	if err != nil && !errors.Is(err, zerr.ErrBlobNotFound) {
+		return err
+	}
+	if exists {
+		return nil
+	}
+
+	_, _, err = imgStore.FullBlobUpload(ctx, repo, content, digest)
+
+	return err
+}
+
+func newVulnerabilityReportManifest(options vulnerabilityReportOptions, subject ispec.Descriptor,
+	reportDigest godigest.Digest, reportSize int64, createdAt time.Time,
+) ispec.Manifest {
+	return ispec.Manifest{
+		SchemaVersion: storageConstants.SchemaVersion,
+		MediaType:     ispec.MediaTypeImageManifest,
+		ArtifactType:  options.artifactType,
+		Subject:       &subject,
+		Config: ispec.Descriptor{
+			MediaType: ispec.MediaTypeEmptyJSON,
+			Digest:    ispec.DescriptorEmptyJSON.Digest,
+			Size:      int64(len(ispec.DescriptorEmptyJSON.Data)),
+		},
+		Layers: []ispec.Descriptor{{
+			MediaType: options.layerMediaType,
+			Digest:    reportDigest,
+			Size:      reportSize,
+		}},
+		Annotations: map[string]string{
+			vulnerabilityReportCreatedAnnotation: createdAt.UTC().Format(time.RFC3339Nano),
+		},
+	}
+}
+
+func (scanner Scanner) putVulnerabilityReportManifest(ctx context.Context, repo string,
+	imgStore storageTypes.ImageStore, reportManifest ispec.Manifest,
+) error {
+	reportManifestBlob, err := json.Marshal(reportManifest)
+	if err != nil {
+		return err
+	}
+
+	reportManifestDigest := godigest.FromBytes(reportManifestBlob)
+	_, _, err = imgStore.PutImageManifest(ctx, repo, reportManifestDigest.String(), ispec.MediaTypeImageManifest,
+		reportManifestBlob, nil)
+	if err != nil {
+		return err
+	}
+
+	if scanner.metaDB != nil {
+		if err = meta.OnUpdateManifest(ctx, repo, reportManifestDigest.String(),
+			ispec.MediaTypeImageManifest, reportManifestDigest, reportManifestBlob,
+			scanner.storeController, scanner.metaDB, scanner.log); err != nil {
+			return err
+		}
 	}
 
 	return nil

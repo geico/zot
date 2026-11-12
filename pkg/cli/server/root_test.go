@@ -179,6 +179,37 @@ func TestLoadConfigurationDecodesPolicyConditions(t *testing.T) {
 	})
 }
 
+func TestLoadConfigurationVulnerabilityReport(t *testing.T) {
+	Convey("LoadConfiguration decodes the optional Trivy vulnerability report setting", t, func() {
+		configs := []struct {
+			content string
+			enabled bool
+		}{
+			{
+				content: `{"storage":{"rootDirectory":"/tmp/zot"},"http":{"address":"127.0.0.1","port":"8080"},` +
+					`"extensions":{"search":{"enable":true,"cve":{"trivy":{"dbRepository":"ghcr.io/aqua/trivy-db"}}}}}`,
+			},
+			{
+				content: `{"storage":{"rootDirectory":"/tmp/zot"},"http":{"address":"127.0.0.1","port":"8080"},` +
+					`"extensions":{"search":{"enable":true,"cve":{"trivy":{"dbRepository":"ghcr.io/aqua/trivy-db",` +
+					`"vulnerabilityReport":{"enable":true}}}}}}`,
+				enabled: true,
+			},
+		}
+
+		for _, tc := range configs {
+			configFile := MakeTempFileWithContent(t, "zot-vulnerability-report.json", tc.content)
+			cfg := config.New()
+
+			So(cli.LoadConfiguration(cfg, configFile), ShouldBeNil)
+			So(cfg.Extensions.Search.CVE.Trivy.VulnerabilityReport != nil, ShouldEqual, tc.enabled)
+			if tc.enabled {
+				So(cfg.Extensions.Search.CVE.Trivy.VulnerabilityReport.Enable, ShouldBeTrue)
+			}
+		}
+	})
+}
+
 func TestLoadConfigurationSyncCredentialHelper(t *testing.T) {
 	Convey("the generic oauth2CredentialHelper dictionary loads and decodes", t, func() {
 		content := `{
